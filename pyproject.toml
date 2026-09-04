@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "leitor-mapcut-cortdeco"
+version = "1.0.0"
+description = "Leitor dos binarios mapcut/cortdeco do DECOMP com exportacao para CSV"
+requires-python = ">=3.10"
+dependencies = [
+    "idecomp==1.14.2",
+    "cfinterface==1.10.1",
+    "pandas==3.0.5",
+    "numpy==2.5.2",
+    "rich==15.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pandas-stubs",
+]
+
+[project.scripts]
+leitor-mapcut-cortdeco = "leitor_mapcut_cortdeco.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
+filterwarnings = [
+    "error",
+    # cfinterface 1.10.1 avisa sobre o uso de STORAGE = "BINARY" como string, mas
+    # e o proprio idecomp 1.14.2 que declara assim; nada a corrigir deste lado.
+    'ignore:Using string "BINARY" for storage type is deprecated:DeprecationWarning',
+]
+
+[tool.ruff]
+line-length = 88
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RET", "ARG", "PTH"]
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "src"
+strict = true
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["idecomp.*", "cfinterface.*"]
+ignore_missing_imports = true

@@ -1,0 +1,62 @@
+{
+  "_comentario": [
+    "Arquivo de configuracao do Leitor Mapcut/Cortdeco.",
+    "Todos os caminhos relativos sao resolvidos a partir do diretorio deste arquivo,",
+    "para que o projeto seja portavel entre maquinas (WSL, servidores Linux).",
+    "As chaves iniciadas por '_' sao comentarios e ignoradas na leitura."
+  ],
+
+  "paths": {
+    "_comentario": "Localizacao dos binarios de entrada e do destino dos CSVs.",
+    "input_directory": ".",
+    "mapcut_file": "mapcut.rv0",
+    "cortdeco_file": "cortdeco.rv0",
+    "output_directory": "output"
+  },
+
+  "logging": {
+    "_comentario": [
+      "Log de auditoria: sai simultaneamente no console e em arquivo rotativo.",
+      "level: DEBUG | INFO | WARNING | ERROR | CRITICAL.",
+      "use_rich: usa RichHandler no console quando a biblioteca rich esta instalada.",
+      "max_bytes / backup_count: politica de rotacao do arquivo de log."
+    ],
+    "level": "INFO",
+    "directory": "logs",
+    "filename": "leitor_mapcut_cortdeco.log",
+    "max_bytes": 5242880,
+    "backup_count": 5,
+    "use_rich": true
+  },
+
+  "export": {
+    "_comentario": [
+      "Formato dos CSVs gerados.",
+      "Padrao portavel (separator ',' e decimal '.') para leitura direta em pandas/R.",
+      "Para abrir no Excel em portugues-BR, use separator ';' e decimal ','.",
+      "float_format null preserva a precisao total do double (round-trip exato);",
+      "use por exemplo '%.10g' apenas se quiser arquivos menores, aceitando perda de bits."
+    ],
+    "separator": ",",
+    "decimal": ".",
+    "float_format": null,
+    "encoding": "utf-8",
+    "write_mapcut": true,
+    "write_cortdeco_wide": true,
+    "write_cortdeco_tidy": true
+  },
+
+  "cortdeco": {
+    "_comentario": [
+      "Geometria de leitura do cortdeco. O numero de cortes POR NO nao esta gravado",
+      "explicitamente no mapcut; ele e o numero de iteracoes da politica.",
+      "cuts_per_node_source:",
+      "  'numero_iteracoes'  -> usa mapcut.numero_iteracoes (padrao);",
+      "  'file_geometry'     -> deriva de (numero_de_registros - 1) / numero_de_nos_com_corte.",
+      "Os dois valores sao sempre calculados e comparados; divergencia gera WARNING.",
+      "cuts_per_node_override: inteiro para forcar o valor manualmente, ou null."
+    ],
+    "cuts_per_node_source": "numero_iteracoes",
+    "cuts_per_node_override": null
+  }
+}
