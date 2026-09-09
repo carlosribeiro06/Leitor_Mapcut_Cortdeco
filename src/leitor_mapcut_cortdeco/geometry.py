@@ -27,6 +27,15 @@ As tres verificacoes de integridade
    algum byte do preenchimento for diferente de zero, a contagem de coeficientes
    esta subestimada e a leitura estaria truncando dados reais.
 
+Bloco de tempo de viagem opcional
+---------------------------------
+Um caso pode nao ter nenhuma UHE com tempo de viagem da agua. Nesse caso
+`numero_uhes_tempo_viagem` e zero, os registros 7 e 8 do mapcut nao existem e o
+bloco de coeficientes de defluencia passada tem largura zero dentro do corte -
+tudo isso e legitimo, e nao sinal de arquivo corrompido. Como o `idecomp` 1.14.2
+nao trata esse caso, os dados de tempo de viagem sao derivados aqui do payload
+bruto; veja a secao "Tempo de viagem da agua" mais abaixo.
+
 Numero de cortes por no
 -----------------------
 Esse valor dimensiona os vetores de leitura e **nao esta gravado explicitamente**
@@ -43,11 +52,12 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import SupportsInt, TypeVar
+from typing import Any, SupportsInt, TypeVar, cast
 
 import numpy as np
 import pandas as pd
 from idecomp.decomp.mapcut import Mapcut
+from idecomp.decomp.modelos.mapcut import SecaoDadosMapcut
 
 from .config import CortdecoSettings
 
@@ -184,6 +194,219 @@ def require_frame(value: pd.DataFrame | None, name: str) -> pd.DataFrame:
     if value.empty:
         raise GeometryError(f"a tabela {name} veio vazia do idecomp")
     return value
+
+
+# ---------------------------------------------------------------------------
+# Tempo de viagem da agua
+#
+# O bloco de tempo de viagem e opcional (veja o topo do modulo). Quando ele nao
+# existe, o `idecomp` 1.14.2 falha de duas maneiras diferentes:
+#
+# * `codigos_uhes_tempo_viagem` indexa a coluna 'codigo_usina' de um DataFrame
+#   que ficou sem coluna alguma, porque o laco que o preenche nao roda, e levanta
+#   `KeyError`. A falha acontece dentro da propriedade, antes de haver retorno,
+#   portanto nenhum dos guardas acima chega a ser alcancado;
+# * `lag_tempo_viagem_por_uhe` fatia com `[-(0 * numero_estagios):]`, que em
+#   Python equivale a `[0:]`, e devolve a lista inteira de `dados_estagios` em
+#   vez de uma lista vazia. Esse e o pior dos dois, porque nao levanta excecao
+#   nenhuma: valores de outro campo chegariam como se fossem lags.
+#
+# Por isso os dados de tempo de viagem sao derivados do payload bruto dos
+# registros 7 e 8, e nao das propriedades da biblioteca. A contagem declarada
+# pelo DECOMP (`numero_uhes_tempo_viagem`) e a autoridade sobre quantos blocos
+# existem; o layout e conferido exigindo que os blocos consumam o payload
+# inteiro, e os codigos decodificados sao conferidos contra a lista de UHEs do
+# caso.
+# ---------------------------------------------------------------------------
+
+
+def raw_data_section(mapcut: Mapcut) -> dict[str, list[Any]]:
+    """Devolve o payload bruto da secao de dados do mapcut.
+
+    As correcoes de decodificacao precisam do vetor de valores como ele saiu do
+    arquivo, e nao das tabelas derivadas pelo idecomp.
+    """
+    section = mapcut.data.get_sections_of_type(SecaoDadosMapcut)
+    if section is None or isinstance(section, list):
+        found = 0 if section is None else len(section)
+        raise GeometryError(
+            "o mapcut nao contem exatamente uma secao de dados; "
+            f"foram encontradas {found}"
+        )
+    return cast("dict[str, list[Any]]", section.data)
+
+
+def travel_time_plant_count(mapcut: Mapcut) -> int:
+    """Numero de UHEs com tempo de viagem declarado pelo DECOMP.
+
+    E a autoridade sobre a existencia do bloco: zero significa que o caso nao tem
+    tempo de viagem e que nenhuma propriedade do idecomp sobre o assunto pode ser
+    consultada, porque todas falham nesse caso.
+    """
+    count = require_int(mapcut.numero_uhes_tempo_viagem, "numero_uhes_tempo_viagem")
+    if count < 0:
+        raise GeometryError(f"numero_uhes_tempo_viagem negativo no mapcut: {count}")
+    return count
+
+
+def travel_time_lags(mapcut: Mapcut) -> list[int]:
+    """Lag maximo de cada par usina/estagio, achatado por usina.
+
+    Returns:
+        Lista vazia quando o caso nao tem tempo de viagem - sem consultar a
+        propriedade do idecomp, que nesse caso devolveria a lista inteira de
+        `dados_estagios`.
+
+    Raises:
+        GeometryError: o vetor nao tem `numero_uhes_tempo_viagem x
+            numero_estagios` valores, ou contem lag negativo.
+    """
+    count = travel_time_plant_count(mapcut)
+    if count == 0:
+        return []
+
+    stage_count = require_int(mapcut.numero_estagios, "numero_estagios")
+    lags = [
+        int(v)
+        for v in require_list(
+            mapcut.lag_tempo_viagem_por_uhe, "lag_tempo_viagem_por_uhe"
+        )
+    ]
+    expected = count * stage_count
+    if len(lags) != expected:
+        raise GeometryError(
+            f"o vetor de lags de tempo de viagem tem {len(lags)} valores, mas "
+            f"eram esperados {expected} ({count} UHEs x {stage_count} estagios)"
+        )
+    negative = sorted({lag for lag in lags if lag < 0})
+    if negative:
+        raise GeometryError(f"lags de tempo de viagem negativos: {negative}")
+    return lags
+
+
+@dataclass(frozen=True)
+class TravelTimeBlock:
+    """Um bloco de tempo de viagem dentro do payload dos registros 7 e 8.
+
+    Attributes:
+        plant_code: codigo da UHE a que o bloco pertence.
+        travel_hours: tempo de viagem da agua, em horas.
+        stage_lags: lag maximo de cada estagio, na ordem dos estagios.
+        pair_start: posicao, no payload, do primeiro par
+            (indice_lag, coeficiente) do bloco.
+    """
+
+    plant_code: int
+    travel_hours: int
+    stage_lags: tuple[int, ...]
+    pair_start: int
+
+    @property
+    def pair_count(self) -> int:
+        """Pares (indice_lag, coeficiente) do bloco: os lags vao de 0 a lag_maximo."""
+        return sum(lag + 1 for lag in self.stage_lags)
+
+    @property
+    def pair_stop(self) -> int:
+        """Posicao imediatamente apos o ultimo valor do bloco."""
+        return self.pair_start + 2 * self.pair_count
+
+
+def travel_time_blocks(mapcut: Mapcut) -> list[TravelTimeBlock]:
+    """Localiza os blocos de tempo de viagem no payload bruto do mapcut.
+
+    Layout do payload (registros 7 e 8), por usina com tempo de viagem:
+
+        [codigo_usina, numero_horas, (indice_lag, coeficiente) x N]
+
+    onde `N = soma sobre os estagios de (lag_maximo + 1)`, porque os lags vao de
+    0 a `lag_maximo` inclusive. Os blocos das usinas sao consecutivos, e o offset
+    tem de ser acumulado de um bloco para o proximo - e exatamente onde o
+    `idecomp` erra, junto com a nao reinicializacao dos acumuladores.
+
+    Exigir que os blocos consumam o payload inteiro e o que confere, por uma via
+    independente, que a contagem declarada e o layout assumido concordam.
+
+    Returns:
+        Um bloco por UHE com tempo de viagem, na ordem do payload; lista vazia
+        quando o caso nao tem tempo de viagem.
+
+    Raises:
+        GeometryError: o payload termina antes do previsto, ou sobram valores
+            depois do ultimo bloco.
+    """
+    count = travel_time_plant_count(mapcut)
+    if count == 0:
+        return []
+
+    stage_count = require_int(mapcut.numero_estagios, "numero_estagios")
+    lags = travel_time_lags(mapcut)
+    raw = raw_data_section(mapcut)["dados_tempo_viagem"]
+
+    blocks: list[TravelTimeBlock] = []
+    offset = 0
+    for position in range(count):
+        if offset + 2 > len(raw):
+            raise GeometryError(
+                f"o payload de tempo de viagem acabou na UHE {position + 1} de "
+                f"{count}: o bloco comecaria em {offset} e o payload tem "
+                f"{len(raw)} valores"
+            )
+        block = TravelTimeBlock(
+            plant_code=int(raw[offset]),
+            travel_hours=int(raw[offset + 1]),
+            stage_lags=tuple(
+                lags[position * stage_count : (position + 1) * stage_count]
+            ),
+            pair_start=offset + 2,
+        )
+        if block.pair_stop > len(raw):
+            raise GeometryError(
+                f"o bloco de tempo de viagem da UHE {block.plant_code} exigiria "
+                f"{block.pair_stop} valores, mas o payload tem {len(raw)}"
+            )
+        blocks.append(block)
+        offset = block.pair_stop
+
+    if offset != len(raw):
+        raise GeometryError(
+            f"a leitura dos blocos de tempo de viagem consumiu {offset} dos "
+            f"{len(raw)} valores do payload. O layout assumido nao corresponde "
+            "ao arquivo."
+        )
+    return blocks
+
+
+def travel_time_plant_codes(mapcut: Mapcut) -> tuple[int, ...]:
+    """Codigos das UHEs com tempo de viagem, na ordem do payload.
+
+    Os codigos decodificados sao conferidos contra a lista de UHEs do caso: uma
+    usina com tempo de viagem que nao esteja entre as UHEs do mapcut, ou um
+    codigo repetido, denunciam que o layout assumido nao corresponde ao arquivo.
+
+    Returns:
+        Tupla vazia quando o caso nao tem tempo de viagem.
+
+    Raises:
+        GeometryError: codigo repetido, ou ausente da lista de UHEs do caso.
+    """
+    codes = tuple(block.plant_code for block in travel_time_blocks(mapcut))
+    if not codes:
+        return ()
+
+    if len(set(codes)) != len(codes):
+        raise GeometryError(
+            f"codigos de UHE com tempo de viagem repetidos: {sorted(codes)}"
+        )
+    known = {int(c) for c in require_list(mapcut.codigos_uhes, "codigos_uhes")}
+    unknown = sorted(set(codes) - known)
+    if unknown:
+        raise GeometryError(
+            f"as UHEs com tempo de viagem {unknown} nao estao entre as UHEs do "
+            "caso. O layout assumido para os registros 7 e 8 nao corresponde ao "
+            "arquivo."
+        )
+    return codes
 
 
 def _uniform_load_blocks(load_blocks_per_stage: list[int]) -> int:
@@ -350,12 +573,7 @@ def build_cut_geometry(
         hydro_plant_codes=tuple(
             int(c) for c in require_list(mapcut.codigos_uhes, "codigos_uhes")
         ),
-        travel_time_plant_codes=tuple(
-            int(c)
-            for c in require_list(
-                mapcut.codigos_uhes_tempo_viagem, "codigos_uhes_tempo_viagem"
-            )
-        ),
+        travel_time_plant_codes=travel_time_plant_codes(mapcut),
         gnl_submarket_codes=tuple(
             int(c)
             for c in require_list(
@@ -377,6 +595,12 @@ def build_cut_geometry(
 
 def _log_geometry(geometry: CutGeometry, logger: logging.Logger) -> None:
     """Registra a geometria em detalhe, para o log bastar como trilha de auditoria."""
+    if not geometry.travel_time_plant_codes:
+        logger.info(
+            "o caso nao tem UHE com tempo de viagem da agua "
+            "(numero_uhes_tempo_viagem = 0): o bloco de coeficientes de "
+            "defluencia passada nao existe dentro do corte"
+        )
     logger.info(
         "geometria do corte: %d bytes por registro, %d coeficientes uteis "
         "(%d bytes) + %d bytes de preenchimento",

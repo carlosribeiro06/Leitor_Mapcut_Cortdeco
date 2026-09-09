@@ -12,23 +12,34 @@ from __future__ import annotations
 import logging
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pytest
+from idecomp.decomp.mapcut import Mapcut
 
 from conftest import (
     SYNTHETIC_COEFFICIENT_COUNT,
+    SYNTHETIC_COEFFICIENT_COUNT_WITHOUT_TRAVEL_TIME,
     SYNTHETIC_CUTS_PER_NODE,
+    SYNTHETIC_MAX_TRAVEL_TIME_LAG,
     SYNTHETIC_RECORD_SIZE,
     SYNTHETIC_TOTAL_RECORDS,
+    SYNTHETIC_TRAVEL_TIME_HOURS,
+    SYNTHETIC_TRAVEL_TIME_PLANT_CODES,
+    SYNTHETIC_TRAVEL_TIME_STAGE_LAGS,
     FakeMapcut,
     write_synthetic_cortdeco,
 )
 from leitor_mapcut_cortdeco.config import CortdecoSettings
 from leitor_mapcut_cortdeco.geometry import (
+    CutGeometry,
     GeometryError,
     build_cut_geometry,
     downstream_plant_indices,
+    travel_time_blocks,
+    travel_time_lags,
+    travel_time_plant_codes,
     validate_geometry,
 )
 
@@ -37,14 +48,25 @@ DEFAULT_CORTDECO_SETTINGS = CortdecoSettings(
 )
 
 
+def _mapcut(fake: FakeMapcut) -> Mapcut:
+    """Trata o duble como um `Mapcut` para o verificador de tipos.
+
+    `FakeMapcut` implementa de proposito apenas o subconjunto do `Mapcut` que a
+    geometria consome, e nao herda dele. Concentrar a conversao aqui mantem o
+    mypy util no resto do arquivo, em vez de espalhar um `type: ignore` por
+    chamada.
+    """
+    return cast("Mapcut", fake)
+
+
 def _build(
     mapcut: FakeMapcut,
     path: Path,
     logger: logging.Logger,
     settings: CortdecoSettings = DEFAULT_CORTDECO_SETTINGS,
-):
+) -> CutGeometry:
     """Atalho para montar a geometria nos testes."""
-    return build_cut_geometry(mapcut, path, settings, logger)
+    return build_cut_geometry(_mapcut(mapcut), path, settings, logger)
 
 
 def test_geometria_do_caso_sintetico(
@@ -198,7 +220,119 @@ def test_contagem_de_registros_divergente_gera_aviso(
 
 def test_topologia_de_jusante_reinterpreta_os_bits(fake_mapcut: FakeMapcut) -> None:
     """Correcao do defeito float32/int32 do idecomp no registro 4 do mapcut."""
-    indices = downstream_plant_indices(fake_mapcut)
+    indices = downstream_plant_indices(_mapcut(fake_mapcut))
 
     assert indices.tolist() == [2, 0]
     assert indices.dtype == np.int64
+
+
+# ---------------------------------------------------------------------------
+# Tempo de viagem da agua
+# ---------------------------------------------------------------------------
+
+
+def test_blocos_de_tempo_viagem_vem_do_payload_bruto(fake_mapcut: FakeMapcut) -> None:
+    """Os codigos das UHEs sao decodificados do payload, nao da propriedade."""
+    blocks = travel_time_blocks(_mapcut(fake_mapcut))
+
+    assert len(blocks) == 1
+    block = blocks[0]
+    assert block.plant_code == SYNTHETIC_TRAVEL_TIME_PLANT_CODES[0]
+    assert block.travel_hours == SYNTHETIC_TRAVEL_TIME_HOURS
+    assert block.stage_lags == SYNTHETIC_TRAVEL_TIME_STAGE_LAGS
+    # Um par (indice_lag, coeficiente) por lag de 0 a lag_maximo, em cada estagio.
+    assert block.pair_count == sum(lag + 1 for lag in SYNTHETIC_TRAVEL_TIME_STAGE_LAGS)
+    assert (
+        travel_time_plant_codes(_mapcut(fake_mapcut))
+        == SYNTHETIC_TRAVEL_TIME_PLANT_CODES
+    )
+
+
+def test_caso_sem_tempo_viagem_produz_bloco_de_largura_zero(
+    fake_mapcut_sem_tempo_viagem: FakeMapcut,
+    synthetic_cortdeco_sem_tempo_viagem: Path,
+    quiet_logger: logging.Logger,
+) -> None:
+    """Zero UHEs com tempo de viagem e caso legitimo, nao arquivo corrompido."""
+    geometry = _build(
+        fake_mapcut_sem_tempo_viagem,
+        synthetic_cortdeco_sem_tempo_viagem,
+        quiet_logger,
+    )
+
+    assert geometry.travel_time_plant_codes == ()
+    assert geometry.travel_time_coefficient_count == 0
+    assert geometry.coefficient_count == SYNTHETIC_COEFFICIENT_COUNT_WITHOUT_TRAVEL_TIME
+    # O corte vai direto do volume armazenado para a geracao GNL.
+    assert geometry.storage_coefficient_count == 2
+    assert geometry.gnl_coefficient_count == 6
+
+    validate_geometry(geometry, synthetic_cortdeco_sem_tempo_viagem, quiet_logger)
+
+
+def test_caso_sem_tempo_viagem_ignora_os_lags_espurios_do_idecomp(
+    fake_mapcut_sem_tempo_viagem: FakeMapcut,
+) -> None:
+    """Com nutv = 0 o idecomp devolve valores de outro campo; eles nao entram."""
+    assert fake_mapcut_sem_tempo_viagem.lag_tempo_viagem_por_uhe
+
+    assert travel_time_lags(_mapcut(fake_mapcut_sem_tempo_viagem)) == []
+    assert travel_time_blocks(_mapcut(fake_mapcut_sem_tempo_viagem)) == []
+    assert travel_time_plant_codes(_mapcut(fake_mapcut_sem_tempo_viagem)) == ()
+
+
+def test_propriedade_defeituosa_do_idecomp_nao_e_consultada(
+    fake_mapcut: FakeMapcut, synthetic_cortdeco: Path, quiet_logger: logging.Logger
+) -> None:
+    """O duble levanta em `codigos_uhes_tempo_viagem`; a geometria tem de passar."""
+    with pytest.raises(KeyError):
+        _ = fake_mapcut.codigos_uhes_tempo_viagem
+
+    geometry = _build(fake_mapcut, synthetic_cortdeco, quiet_logger)
+
+    assert geometry.travel_time_plant_codes == SYNTHETIC_TRAVEL_TIME_PLANT_CODES
+    assert geometry.travel_time_coefficient_count == (
+        len(SYNTHETIC_TRAVEL_TIME_PLANT_CODES) * SYNTHETIC_MAX_TRAVEL_TIME_LAG
+    )
+
+
+def test_vetor_de_lags_com_tamanho_divergente(fake_mapcut: FakeMapcut) -> None:
+    """O vetor tem de ter numero_uhes_tempo_viagem x numero_estagios valores."""
+    fake_mapcut.lag_tempo_viagem_por_uhe = [SYNTHETIC_MAX_TRAVEL_TIME_LAG]
+
+    with pytest.raises(GeometryError, match="eram esperados 3"):
+        travel_time_lags(_mapcut(fake_mapcut))
+
+
+def test_payload_de_tempo_viagem_com_sobra(fake_mapcut: FakeMapcut) -> None:
+    """Sobra no payload significa que o layout assumido nao corresponde."""
+    fake_mapcut.data.section.data["dados_tempo_viagem"] += [0, 0.0]
+
+    with pytest.raises(GeometryError, match="nao corresponde"):
+        travel_time_blocks(_mapcut(fake_mapcut))
+
+
+def test_payload_de_tempo_viagem_truncado(fake_mapcut: FakeMapcut) -> None:
+    """Payload curto tambem denuncia layout ou contagem errados."""
+    fake_mapcut.data.section.data["dados_tempo_viagem"] = [
+        SYNTHETIC_TRAVEL_TIME_PLANT_CODES[0],
+        SYNTHETIC_TRAVEL_TIME_HOURS,
+    ]
+
+    with pytest.raises(GeometryError, match="exigiria"):
+        travel_time_blocks(_mapcut(fake_mapcut))
+
+
+def test_uhe_com_tempo_viagem_fora_da_lista_de_uhes(fake_mapcut: FakeMapcut) -> None:
+    """Um codigo que nao e UHE do caso denuncia layout errado."""
+    fake_mapcut.data.section.data["dados_tempo_viagem"][0] = 999
+
+    with pytest.raises(GeometryError, match="nao estao entre as UHEs"):
+        travel_time_plant_codes(_mapcut(fake_mapcut))
+
+
+def test_numero_de_uhes_com_tempo_viagem_negativo(fake_mapcut: FakeMapcut) -> None:
+    fake_mapcut.numero_uhes_tempo_viagem = -1
+
+    with pytest.raises(GeometryError, match="negativo"):
+        travel_time_plant_codes(_mapcut(fake_mapcut))

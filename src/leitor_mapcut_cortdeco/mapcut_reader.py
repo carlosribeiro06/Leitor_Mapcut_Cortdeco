@@ -24,27 +24,60 @@ auditar exatamente o que foi corrigido.
    `1 + 4*n + soma(patamares)`, mas o registro realmente ocupa
    `1 + 3*n` inteiros mais `numero_estagios * n` reais. Com o passo errado, so o
    primeiro estagio e decodificado. A correcao usa o passo verdadeiro.
+
+Casos sem UHE com tempo de viagem
+---------------------------------
+Quando `numero_uhes_tempo_viagem` e zero - situacao legitima, e nao arquivo
+corrompido -, as duas propriedades do `idecomp` sobre o assunto ficam
+inutilizaveis: `codigos_uhes_tempo_viagem` levanta `KeyError` e
+`lag_tempo_viagem_por_uhe` devolve valores de outro campo. Os acessores de
+`geometry` (`travel_time_plant_count`, `travel_time_lags`, `travel_time_blocks`)
+tratam esse caso, e as tabelas de tempo de viagem deste modulo saem **vazias mas
+com as colunas e os dtypes declarados**, para que o CSV correspondente continue
+sendo autodescritivo em vez de virar um arquivo sem cabecalho.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 import numpy as np
 import pandas as pd
 from idecomp.decomp.mapcut import Mapcut
-from idecomp.decomp.modelos.mapcut import SecaoDadosMapcut
 
 from .geometry import (
     CutGeometry,
     GeometryError,
     downstream_plant_indices,
+    raw_data_section,
     require_frame,
     require_int,
     require_list,
+    travel_time_blocks,
+    travel_time_lags,
+    travel_time_plant_codes,
+    travel_time_plant_count,
 )
+
+# Colunas e dtypes das tabelas de tempo de viagem. Ficam declarados aqui porque
+# sao usados tanto no caminho normal quanto no caso sem tempo de viagem, em que a
+# tabela sai vazia - e vazia com as mesmas colunas e os mesmos dtypes, para que
+# quem consome os CSVs nao precise distinguir os dois casos.
+TRAVEL_TIME_DTYPES: Mapping[str, str] = {
+    "codigo_usina": "int64",
+    "numero_horas": "int64",
+    "estagio": "int64",
+    "indice_lag": "int64",
+    "coeficiente_amortecimento": "float64",
+}
+TRAVEL_TIME_LAGS_DTYPES: Mapping[str, str] = {
+    "codigo_usina": "int64",
+    "estagio": "int64",
+    "lag_maximo": "int64",
+}
 
 # Descricao de cada escalar do mapcut, para que o CSV de metadados seja
 # autoexplicativo mesmo fora do contexto deste projeto.
@@ -86,20 +119,17 @@ def read_mapcut(path: Path, logger: logging.Logger) -> Mapcut:
     return mapcut
 
 
-def _raw_section(mapcut: Mapcut) -> dict[str, list[Any]]:
-    """Devolve o payload bruto da secao de dados do mapcut.
+def _empty_table(dtypes: Mapping[str, str]) -> pd.DataFrame:
+    """Monta uma tabela sem linhas, mas com as colunas e os dtypes declarados.
 
-    As correcoes de decodificacao precisam do vetor de valores como ele saiu do
-    arquivo, e nao das tabelas derivadas pelo idecomp.
+    Uma tabela vazia construida com `pd.DataFrame([])` sai tambem *sem colunas*,
+    e o CSV correspondente fica sem cabecalho - a mesma patologia do idecomp que
+    este modulo corrige. Por isso todo caminho que pode produzir tabela vazia
+    passa por aqui.
     """
-    section = mapcut.data.get_sections_of_type(SecaoDadosMapcut)
-    if section is None or isinstance(section, list):
-        found = 0 if section is None else len(section)
-        raise GeometryError(
-            "o mapcut nao contem exatamente uma secao de dados; "
-            f"foram encontradas {found}"
-        )
-    return cast("dict[str, list[Any]]", section.data)
+    return pd.DataFrame(
+        {name: pd.Series(dtype=dtype) for name, dtype in dtypes.items()}
+    )
 
 
 def _metadata_table(mapcut: Mapcut) -> pd.DataFrame:
@@ -217,26 +247,6 @@ def _stages_table(mapcut: Mapcut) -> pd.DataFrame:
     )
 
 
-def _travel_time_plant_codes(mapcut: Mapcut) -> list[int]:
-    """Codigos das UHEs com tempo de viagem, na ordem do payload."""
-    return [
-        int(c)
-        for c in require_list(
-            mapcut.codigos_uhes_tempo_viagem, "codigos_uhes_tempo_viagem"
-        )
-    ]
-
-
-def _travel_time_lags(mapcut: Mapcut) -> list[int]:
-    """Lag maximo de cada par usina/estagio, achatado por usina."""
-    return [
-        int(v)
-        for v in require_list(
-            mapcut.lag_tempo_viagem_por_uhe, "lag_tempo_viagem_por_uhe"
-        )
-    ]
-
-
 def _travel_time_lags_table(mapcut: Mapcut, logger: logging.Logger) -> pd.DataFrame:
     """Monta a tabela de lag maximo de tempo de viagem por usina e estagio.
 
@@ -247,17 +257,17 @@ def _travel_time_lags_table(mapcut: Mapcut, logger: logging.Logger) -> pd.DataFr
     e inofensivo quando todos os lags sao iguais - o caso mais comum. Quando nao
     forem, a atribuicao aqui segue a convencao da propriedade e um WARNING avisa
     que ela nao pode ser conferida por outra via.
+
+    Returns:
+        A tabela vazia, com as colunas declaradas, quando o caso nao tem UHE com
+        tempo de viagem.
     """
+    plant_codes = travel_time_plant_codes(mapcut)
+    if not plant_codes:
+        return _empty_table(TRAVEL_TIME_LAGS_DTYPES)
+
     stage_count = require_int(mapcut.numero_estagios, "numero_estagios")
-    plant_codes = _travel_time_plant_codes(mapcut)
-    lags = _travel_time_lags(mapcut)
-    expected = len(plant_codes) * stage_count
-    if len(lags) != expected:
-        raise GeometryError(
-            f"o vetor de lags de tempo de viagem tem {len(lags)} valores, mas "
-            f"eram esperados {expected} ({len(plant_codes)} UHEs x "
-            f"{stage_count} estagios)"
-        )
+    lags = travel_time_lags(mapcut)
     if len(set(lags)) > 1:
         logger.warning(
             "os lags de tempo de viagem nao sao todos iguais (%s). A atribuicao "
@@ -274,7 +284,7 @@ def _travel_time_lags_table(mapcut: Mapcut, logger: logging.Logger) -> pd.DataFr
             rows.append(
                 {"codigo_usina": plant_code, "estagio": stage, "lag_maximo": lag}
             )
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows).astype(dict(TRAVEL_TIME_LAGS_DTYPES))
 
 
 def _travel_time_table(mapcut: Mapcut, logger: logging.Logger) -> pd.DataFrame:
@@ -285,53 +295,50 @@ def _travel_time_table(mapcut: Mapcut, logger: logging.Logger) -> pd.DataFrame:
         [codigo_usina, numero_horas, (indice_lag, coeficiente) x N]
 
     onde `N = soma sobre os estagios de (lag_maximo + 1)`, porque os lags vao de
-    0 a `lag_maximo` inclusive. Os blocos das usinas sao consecutivos, e o offset
-    tem de ser acumulado de um bloco para o proximo - e exatamente onde o
-    `idecomp` erra, junto com a nao reinicializacao dos acumuladores.
+    0 a `lag_maximo` inclusive. A localizacao dos blocos e o acumulo do offset -
+    exatamente onde o `idecomp` erra - ficam em `geometry.travel_time_blocks`,
+    que tambem confere que os blocos consomem o payload inteiro.
+
+    Returns:
+        A tabela vazia, com as colunas declaradas, quando o caso nao tem UHE com
+        tempo de viagem.
     """
-    raw = _raw_section(mapcut)["dados_tempo_viagem"]
+    blocks = travel_time_blocks(mapcut)
+    if not blocks:
+        logger.info(
+            "sem dados de tempo de viagem a reconstruir: o caso nao tem UHE com "
+            "tempo de viagem da agua"
+        )
+        return _empty_table(TRAVEL_TIME_DTYPES)
+
+    raw = raw_data_section(mapcut)["dados_tempo_viagem"]
     stage_count = require_int(mapcut.numero_estagios, "numero_estagios")
-    plant_codes = _travel_time_plant_codes(mapcut)
-    lags = _travel_time_lags(mapcut)
 
     rows = []
-    offset = 0
-    for plant_position in range(len(plant_codes)):
-        plant_code = int(raw[offset])
-        travel_hours = int(raw[offset + 1])
-        plant_lags = lags[
-            plant_position * stage_count : (plant_position + 1) * stage_count
-        ]
-        cursor = offset + 2
-        for stage, lag_maximum in enumerate(plant_lags, start=1):
+    for block in blocks:
+        cursor = block.pair_start
+        for stage, lag_maximum in enumerate(block.stage_lags, start=1):
             for _ in range(lag_maximum + 1):
                 rows.append(
                     {
-                        "codigo_usina": plant_code,
-                        "numero_horas": travel_hours,
+                        "codigo_usina": block.plant_code,
+                        "numero_horas": block.travel_hours,
                         "estagio": stage,
                         "indice_lag": int(raw[cursor]),
                         "coeficiente_amortecimento": float(raw[cursor + 1]),
                     }
                 )
                 cursor += 2
-        offset = cursor
 
-    if offset != len(raw):
-        raise GeometryError(
-            f"a reconstrucao dos dados de tempo de viagem consumiu {offset} dos "
-            f"{len(raw)} valores do payload. O layout assumido nao corresponde "
-            "ao arquivo."
-        )
     logger.info(
         "dados de tempo de viagem reconstruidos: %d linhas (%d UHEs x %d estagios); "
         "o idecomp devolveria %d linhas",
         len(rows),
-        len(plant_codes),
+        len(blocks),
         stage_count,
         len(require_frame(mapcut.dados_tempo_viagem, "dados_tempo_viagem")),
     )
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows).astype(dict(TRAVEL_TIME_DTYPES))
 
 
 def _gnl_tables(
@@ -360,7 +367,7 @@ def _gnl_tables(
         A tabela de dados de GNL por estagio/submercado e a tabela do bloco de
         valores reais.
     """
-    raw = _raw_section(mapcut)["dados_gnl"]
+    raw = raw_data_section(mapcut)["dados_gnl"]
     stage_count = require_int(mapcut.numero_estagios, "numero_estagios")
 
     rows: list[dict[str, int]] = []
@@ -435,6 +442,13 @@ def build_mapcut_tables(
         `_idecomp_bruto` sao a saida literal da biblioteca, mantida para auditoria.
     """
     gnl_table, gnl_values_table = _gnl_tables(mapcut, logger)
+    # A tabela bruta do idecomp so pode ser pedida quando o caso tem tempo de
+    # viagem; sem isso a propriedade levanta KeyError. O caminho explicito para o
+    # caso legitimamente vazio evita enfraquecer o `require_frame`.
+    if travel_time_plant_count(mapcut) == 0:
+        raw_travel_time = _empty_table(TRAVEL_TIME_DTYPES)
+    else:
+        raw_travel_time = require_frame(mapcut.dados_tempo_viagem, "dados_tempo_viagem")
     return {
         "mapcut_metadados": _metadata_table(mapcut),
         "mapcut_usinas_hidraulicas": _hydro_plants_table(mapcut, logger),
@@ -450,8 +464,6 @@ def build_mapcut_tables(
         ),
         "mapcut_custos": require_frame(mapcut.dados_custos, "dados_custos"),
         "mapcut_usinas_jusante_idecomp_bruto": _hydro_plants_raw_table(mapcut),
-        "mapcut_tempo_viagem_idecomp_bruto": require_frame(
-            mapcut.dados_tempo_viagem, "dados_tempo_viagem"
-        ),
+        "mapcut_tempo_viagem_idecomp_bruto": raw_travel_time,
         "mapcut_gnl_idecomp_bruto": require_frame(mapcut.dados_gnl, "dados_gnl"),
     }

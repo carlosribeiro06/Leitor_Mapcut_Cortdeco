@@ -27,6 +27,18 @@ from leitor_mapcut_cortdeco.pipeline import run
 # precisa de `float_precision="round_trip"` para nao perder os ultimos bits.
 ROUND_TRIP = {"float_precision": "round_trip"}
 
+# Tabelas que ficam legitimamente vazias quando o caso nao tem nenhuma UHE com
+# tempo de viagem da agua. Sao as unicas ausencias aceitaveis: qualquer outra
+# tabela vazia e defeito de decodificacao.
+TRAVEL_TIME_TABLES = frozenset(
+    {
+        "mapcut_tempo_viagem",
+        "mapcut_tempo_viagem_lags",
+        "mapcut_tempo_viagem_idecomp_bruto",
+        "cortdeco_coef_defluencia_tempo_viagem",
+    }
+)
+
 
 @pytest.fixture
 def real_workspace(
@@ -56,23 +68,77 @@ def test_execucao_completa_grava_todos_os_csvs(report, real_workspace: Path) -> 
 
     assert len(report.exported) == 20
     assert all(record.path.is_file() for record in report.exported)
-    assert all(record.rows > 0 for record in report.exported)
     assert sorted(p.name for p in output.glob("*.csv")) == sorted(
         f"{record.name}.csv" for record in report.exported
     )
+    # O conjunto de arquivos gravados nao depende do caso: tabela vazia tambem e
+    # gravada, com cabecalho. Mas so as de tempo de viagem podem estar vazias, e
+    # so quando o caso nao tem UHE com tempo de viagem.
+    esperadas_vazias = (
+        set() if report.geometry.travel_time_plant_codes else set(TRAVEL_TIME_TABLES)
+    )
+    vazias = {record.name for record in report.exported if record.rows == 0}
+
+    assert vazias == esperadas_vazias
 
 
-def test_geometria_do_caso_real(report) -> None:
-    """Valores do caso rv0 deste repositorio, conferidos contra o arquivo."""
+def test_csv_vazio_sai_com_cabecalho_e_gera_aviso(
+    real_workspace: Path,
+    caplog_logger: logging.Logger,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """O contrato da tabela vazia: arquivo presente, cabecalho, e aviso no log."""
+    report = run(load_settings(real_workspace), caplog_logger)
+    if report.geometry.travel_time_plant_codes:
+        pytest.skip("o deck presente tem UHE com tempo de viagem")
+
+    assert "apenas com o cabecalho" in caplog.text
+    for name in sorted(TRAVEL_TIME_TABLES):
+        assert name in caplog.text
+
+    # O arquivo existe e contem exatamente uma linha: o cabecalho.
+    linhas = (
+        (report.output_directory / "mapcut_tempo_viagem.csv")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    )
+    assert linhas == [
+        "codigo_usina,numero_horas,estagio,indice_lag,coeficiente_amortecimento"
+    ]
+
+
+def test_geometria_do_caso_real(report, real_workspace: Path) -> None:
+    """Invariantes da geometria, validas para qualquer deck.
+
+    Os binarios de entrada nao sao mais versionados e mudam a cada caso, portanto
+    fixar aqui os numeros de um deck especifico tornaria o teste falso na proxima
+    troca de caso - foi o que aconteceu quando o deck com tempo de viagem deu
+    lugar a um sem. O que se afirma aqui sao as relacoes que qualquer deck tem de
+    satisfazer; os numeros do deck com tempo de viagem ficam pinados em
+    `test_deck_com_tempo_viagem.py`, que traz o proprio deck do historico do git.
+    """
     geometry = report.geometry
+    cortdeco_size = (real_workspace.parent / "cortdeco.rv0").stat().st_size
 
-    assert geometry.record_size_bytes == 26976
-    assert geometry.coefficient_count == 218
-    assert geometry.cuts_per_node == 73
+    # O arquivo e um numero inteiro de registros, e todos eles foram contados.
+    assert geometry.record_size_bytes > 0
+    assert geometry.total_cut_records * geometry.record_size_bytes == cortdeco_size
+    # Um corte por no mais o registro extra do ultimo estagio que constroi cortes.
+    assert geometry.expected_total_records == (
+        geometry.cuts_per_node * geometry.cut_building_node_count + 1
+    )
+    assert geometry.total_cut_records == geometry.expected_total_records
+    # As duas vias independentes de obter os cortes por no tem de concordar.
     assert geometry.cuts_per_node_from_file == geometry.cuts_per_node_from_iterations
-    assert geometry.cut_building_node_count == 6
-    assert geometry.total_cut_records == 439
-    assert geometry.expected_total_records == 439
+    assert geometry.cuts_per_node == geometry.cuts_per_node_from_iterations
+    # Os coeficientes cabem no registro, com preenchimento nao negativo.
+    assert geometry.used_bytes_per_record <= geometry.record_size_bytes
+    assert geometry.coefficient_count == (
+        1
+        + geometry.storage_coefficient_count
+        + geometry.travel_time_coefficient_count
+        + geometry.gnl_coefficient_count
+    )
 
 
 def test_wide_tem_uma_linha_por_registro_do_arquivo(report) -> None:
@@ -168,7 +234,11 @@ def test_somente_mapcut_nao_gera_tabelas_de_cortes(
     nomes = {record.name for record in report.exported}
     assert not any(nome.startswith("cortdeco_") for nome in nomes)
     # A geometria continua sendo derivada e conferida contra o cortdeco.
-    assert report.geometry.cuts_per_node == 73
+    assert report.geometry.cuts_per_node > 0
+    assert (
+        report.geometry.cuts_per_node == report.geometry.cuts_per_node_from_iterations
+    )
+    assert report.geometry.total_cut_records == report.geometry.expected_total_records
 
 
 def test_desligar_a_exportacao_do_mapcut(
@@ -208,7 +278,7 @@ def test_formato_excel_pt_br(
         report.output_directory / "cortdeco_cortes.csv", sep=";", decimal=","
     )
 
-    assert len(cuts) == 439
+    assert len(cuts) == report.geometry.total_cut_records
     assert cuts["rhs"].dtype == np.float64
 
 

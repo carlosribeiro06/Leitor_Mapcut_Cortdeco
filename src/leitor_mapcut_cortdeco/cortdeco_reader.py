@@ -29,12 +29,22 @@ coeficientes de cada corte colapsam em tres valores ambiguos. A tabela tidy de
 GNL deste modulo e derivada diretamente dos nomes das colunas do formato wide,
 separando as duas dimensoes; a saida literal da biblioteca e mantida em
 `cortdeco_coef_geracao_gnl_idecomp_bruto` para auditoria.
+
+Casos sem UHE com tempo de viagem
+---------------------------------
+Quando o caso nao tem UHE com tempo de viagem, o bloco 2 tem largura zero: o
+corte vai direto do volume armazenado para a geracao GNL. A propriedade
+`Cortdeco.coeficientes_defluencia_tempo_viagem` nao trata esse caso - ela faz
+`.str.split("uhe", expand=True)[1]` sobre um `melt` sem linhas, e o
+`expand=True` devolve um DataFrame sem colunas, de modo que o `[1]` levanta
+`KeyError`. A tabela tidy correspondente sai vazia, com as colunas declaradas.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Mapping
 from pathlib import Path
 
 import pandas as pd
@@ -44,6 +54,17 @@ from .geometry import CutGeometry, GeometryError, require_frame
 
 # Colunas que identificam o corte; comuns a todas as tabelas tidy.
 CUT_KEY_COLUMNS: tuple[str, ...] = ("indice_corte", "no", "estagio")
+
+# Colunas e dtypes da tabela tidy de defluencia por tempo de viagem, declarados
+# para que ela saia com o mesmo cabecalho tenha o caso tempo de viagem ou nao.
+TRAVEL_TIME_COEFFICIENT_DTYPES: Mapping[str, str] = {
+    "indice_corte": "int64",
+    "no": "int64",
+    "estagio": "int64",
+    "codigo_usina": "int64",
+    "lag": "int64",
+    "valor": "float64",
+}
 
 # `pi_gnl_sbm{submercado}_pat{patamar}_lag{estagio}`
 GNL_COLUMN_PATTERN = re.compile(r"^pi_gnl_sbm(\d+)_pat(\d+)_lag(\d+)$")
@@ -231,10 +252,20 @@ def build_cortdeco_tables(
         tables["cortdeco_coef_volume_armazenado"] = require_frame(
             cortdeco.coeficientes_volume_armazenado, "coeficientes_volume_armazenado"
         )
-        tables["cortdeco_coef_defluencia_tempo_viagem"] = require_frame(
-            cortdeco.coeficientes_defluencia_tempo_viagem,
-            "coeficientes_defluencia_tempo_viagem",
-        )
+        if geometry.travel_time_plant_codes:
+            tables["cortdeco_coef_defluencia_tempo_viagem"] = require_frame(
+                cortdeco.coeficientes_defluencia_tempo_viagem,
+                "coeficientes_defluencia_tempo_viagem",
+            )
+        else:
+            # Bloco de largura zero: a propriedade do idecomp levanta KeyError
+            # nesse caso (veja o topo do modulo).
+            tables["cortdeco_coef_defluencia_tempo_viagem"] = pd.DataFrame(
+                {
+                    name: pd.Series(dtype=dtype)
+                    for name, dtype in TRAVEL_TIME_COEFFICIENT_DTYPES.items()
+                }
+            )
         tables["cortdeco_coef_geracao_gnl"] = _gnl_tidy_table(cuts)
         tables["cortdeco_coef_geracao_gnl_idecomp_bruto"] = require_frame(
             cortdeco.coeficientes_geracao_gnl, "coeficientes_geracao_gnl"

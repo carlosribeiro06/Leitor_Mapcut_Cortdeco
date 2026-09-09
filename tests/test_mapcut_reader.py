@@ -19,11 +19,29 @@ import pytest
 
 from leitor_mapcut_cortdeco.config import CortdecoSettings
 from leitor_mapcut_cortdeco.geometry import build_cut_geometry
-from leitor_mapcut_cortdeco.mapcut_reader import build_mapcut_tables, read_mapcut
+from leitor_mapcut_cortdeco.mapcut_reader import (
+    TRAVEL_TIME_DTYPES,
+    TRAVEL_TIME_LAGS_DTYPES,
+    build_mapcut_tables,
+    read_mapcut,
+)
 
 DEFAULT_CORTDECO_SETTINGS = CortdecoSettings(
     cuts_per_node_source="numero_iteracoes", cuts_per_node_override=None
 )
+
+# Tabelas que saem legitimamente vazias quando o caso nao tem UHE com tempo de
+# viagem. Vazias, mas com cabecalho: veja o teste de colunas e dtypes.
+TRAVEL_TIME_TABLES = (
+    "mapcut_tempo_viagem",
+    "mapcut_tempo_viagem_lags",
+    "mapcut_tempo_viagem_idecomp_bruto",
+)
+
+
+def _travel_time_plant_count(real_tables: dict) -> int:
+    """Numero de UHEs com tempo de viagem do deck presente no repositorio."""
+    return int(real_tables["mapcut"].numero_uhes_tempo_viagem)
 
 
 @pytest.fixture(scope="module")
@@ -66,10 +84,45 @@ def test_todas_as_tabelas_esperadas_sao_geradas(real_tables: dict) -> None:
     }
 
 
-def test_nenhuma_tabela_esta_vazia(real_tables: dict) -> None:
-    vazias = [name for name, table in real_tables["tables"].items() if table.empty]
+def test_so_estao_vazias_as_tabelas_cuja_ausencia_e_legitima(
+    real_tables: dict,
+) -> None:
+    """Uma tabela vazia so e aceitavel quando o dado nao existe no caso.
 
-    assert vazias == []
+    A unica ausencia legitima e a do tempo de viagem, e so quando o caso nao tem
+    nenhuma UHE com tempo de viagem. Qualquer outra tabela vazia e defeito de
+    decodificacao, e por isso a comparacao e por igualdade de conjuntos - nao por
+    inclusao, que deixaria passar tabela vazia inesperada.
+    """
+    tables = real_tables["tables"]
+    esperadas_vazias = (
+        set(TRAVEL_TIME_TABLES) if _travel_time_plant_count(real_tables) == 0 else set()
+    )
+
+    vazias = {name for name, table in tables.items() if table.empty}
+
+    assert vazias == esperadas_vazias
+    # Vazia nao pode significar "sem colunas": o CSV tem de sair com cabecalho.
+    for name in sorted(vazias):
+        assert list(tables[name].columns), f"{name} saiu sem colunas"
+
+
+def test_tabelas_de_tempo_viagem_vazias_conservam_colunas_e_dtypes(
+    real_tables: dict,
+) -> None:
+    """Sem tempo de viagem, as tabelas saem vazias mas com o contrato preservado."""
+    if _travel_time_plant_count(real_tables) > 0:
+        pytest.skip("o deck presente tem UHE com tempo de viagem")
+    tables = real_tables["tables"]
+
+    for name, dtypes in (
+        ("mapcut_tempo_viagem", TRAVEL_TIME_DTYPES),
+        ("mapcut_tempo_viagem_lags", TRAVEL_TIME_LAGS_DTYPES),
+        ("mapcut_tempo_viagem_idecomp_bruto", TRAVEL_TIME_DTYPES),
+    ):
+        table = tables[name]
+        assert list(table.columns) == list(dtypes), name
+        assert [str(dtype) for dtype in table.dtypes] == list(dtypes.values()), name
 
 
 def test_topologia_de_jusante_e_um_indice_posicional(real_tables: dict) -> None:
@@ -99,12 +152,20 @@ def test_cascata_conhecida_do_rio_grande(real_tables: dict) -> None:
 def test_tempo_viagem_corrigido_tem_uma_linha_por_usina_estagio_e_lag(
     real_tables: dict,
 ) -> None:
-    """O idecomp devolve 84 linhas por nao reiniciar os acumuladores; o certo e 56."""
+    """O idecomp devolve 84 linhas por nao reiniciar os acumuladores; o certo e 56.
+
+    So se aplica a deck com tempo de viagem: sem nenhuma UHE com tempo de viagem
+    nao ha excesso do idecomp para comparar, e a tabela corrigida esta vazia por
+    construcao. Esse caso e coberto pelos testes de tabela vazia acima e, no deck
+    com tempo de viagem, por `test_deck_com_tempo_viagem.py`.
+    """
     mapcut = real_tables["mapcut"]
     travel_time = real_tables["tables"]["mapcut_tempo_viagem"]
     raw = real_tables["tables"]["mapcut_tempo_viagem_idecomp_bruto"]
 
-    plant_count = int(mapcut.numero_uhes_tempo_viagem)
+    plant_count = _travel_time_plant_count(real_tables)
+    if plant_count == 0:
+        pytest.skip("o deck presente nao tem UHE com tempo de viagem")
     stage_count = int(mapcut.numero_estagios)
     lag_count = int(mapcut.maximo_lag_tempo_viagem) + 1  # os lags vao de 0 a max
 
