@@ -8,3 +8,13 @@ __pycache__/
 output/
 logs/
 settings.local.json
+
+# Binarios de entrada do DECOMP (decks locais, trocados a cada caso/revisao).
+# Nao versionar: sao grandes, mudam a cada estudo e nao sao artefatos do codigo.
+# Os testes de caso real (tests/conftest.py) sao ignorados quando os binarios nao
+# estao na raiz do projeto. O deck com tempo de viagem usado no desenvolvimento
+# original continua no historico e pode ser recuperado com:
+#     git show 353ebf8:mapcut.rv0   > mapcut.rv0
+#     git show 353ebf8:cortdeco.rv0 > cortdeco.rv0
+mapcut.*
+cortdeco.*
