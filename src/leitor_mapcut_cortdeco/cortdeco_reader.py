@@ -66,6 +66,17 @@ TRAVEL_TIME_COEFFICIENT_DTYPES: Mapping[str, str] = {
     "valor": "float64",
 }
 
+# Idem para a saida literal do idecomp do bloco de GNL, que tem a mesma forma de
+# falha quando o caso nao tem UTE a GNL.
+GNL_COEFFICIENT_DTYPES: Mapping[str, str] = {
+    "indice_corte": "int64",
+    "no": "int64",
+    "estagio": "int64",
+    "codigo_submercado": "int64",
+    "lag": "int64",
+    "valor": "float64",
+}
+
 # `pi_gnl_sbm{submercado}_pat{patamar}_lag{estagio}`
 GNL_COLUMN_PATTERN = re.compile(r"^pi_gnl_sbm(\d+)_pat(\d+)_lag(\d+)$")
 
@@ -267,9 +278,19 @@ def build_cortdeco_tables(
                 }
             )
         tables["cortdeco_coef_geracao_gnl"] = _gnl_tidy_table(cuts)
-        tables["cortdeco_coef_geracao_gnl_idecomp_bruto"] = require_frame(
-            cortdeco.coeficientes_geracao_gnl, "coeficientes_geracao_gnl"
-        )
+        if geometry.gnl_submarket_codes:
+            tables["cortdeco_coef_geracao_gnl_idecomp_bruto"] = require_frame(
+                cortdeco.coeficientes_geracao_gnl, "coeficientes_geracao_gnl"
+            )
+        else:
+            # Bloco de largura zero: a propriedade do idecomp levanta KeyError
+            # nesse caso, pelo mesmo motivo do bloco de tempo de viagem.
+            tables["cortdeco_coef_geracao_gnl_idecomp_bruto"] = pd.DataFrame(
+                {
+                    name: pd.Series(dtype=dtype)
+                    for name, dtype in GNL_COEFFICIENT_DTYPES.items()
+                }
+            )
         logger.info(
             "tabelas tidy montadas: %d coeficientes de volume armazenado, "
             "%d de defluencia por tempo de viagem, %d de geracao GNL "

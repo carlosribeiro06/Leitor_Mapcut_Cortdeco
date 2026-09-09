@@ -25,16 +25,30 @@ auditar exatamente o que foi corrigido.
    `1 + 3*n` inteiros mais `numero_estagios * n` reais. Com o passo errado, so o
    primeiro estagio e decodificado. A correcao usa o passo verdadeiro.
 
-Casos sem UHE com tempo de viagem
----------------------------------
-Quando `numero_uhes_tempo_viagem` e zero - situacao legitima, e nao arquivo
-corrompido -, as duas propriedades do `idecomp` sobre o assunto ficam
-inutilizaveis: `codigos_uhes_tempo_viagem` levanta `KeyError` e
-`lag_tempo_viagem_por_uhe` devolve valores de outro campo. Os acessores de
-`geometry` (`travel_time_plant_count`, `travel_time_lags`, `travel_time_blocks`)
-tratam esse caso, e as tabelas de tempo de viagem deste modulo saem **vazias mas
-com as colunas e os dtypes declarados**, para que o CSV correspondente continue
-sendo autodescritivo em vez de virar um arquivo sem cabecalho.
+Blocos ausentes e tabelas vazias
+--------------------------------
+Dois blocos do mapcut sao opcionais, e a ausencia de cada um e legitima - nao
+arquivo corrompido:
+
+* **tempo de viagem** (`numero_uhes_tempo_viagem` igual a zero) - a propriedade
+  `codigos_uhes_tempo_viagem` levanta `KeyError` e `lag_tempo_viagem_por_uhe`
+  devolve valores de outro campo;
+* **GNL** (nenhuma UTE a GNL) - `dados_gnl` e `codigos_submercados_gnl` falham do
+  mesmo jeito, porque o payload nao tem registro algum para percorrer.
+
+Nos dois casos os acessores de `geometry` tratam a ausencia, e as tabelas
+correspondentes deste modulo saem **vazias mas com as colunas e os dtypes
+declarados**, para que o CSV continue autodescritivo em vez de virar um arquivo
+sem cabecalho.
+
+Quando a saida literal nao pode ser produzida
+---------------------------------------------
+A propriedade `dados_gnl` nem sempre e avaliavel: com poucos estagios o passo
+errado dela sai do payload e ela levanta `IndexError`. Nesse caso nao existe
+saida literal para auditar, e `mapcut_gnl_idecomp_bruto` sai vazia com um WARNING
+explicando o motivo. A previsao fica em `_idecomp_gnl_frame_is_evaluable`, que e
+o unico ponto do projeto a espelhar de proposito uma aritmetica defeituosa da
+biblioteca.
 """
 
 from __future__ import annotations
@@ -52,6 +66,7 @@ from .geometry import (
     CutGeometry,
     GeometryError,
     downstream_plant_indices,
+    gnl_stage_blocks,
     raw_data_section,
     require_frame,
     require_int,
@@ -78,6 +93,21 @@ TRAVEL_TIME_LAGS_DTYPES: Mapping[str, str] = {
     "estagio": "int64",
     "lag_maximo": "int64",
 }
+
+# Idem para as tabelas de GNL, que ficam vazias em caso sem UTE a GNL.
+GNL_DTYPES: Mapping[str, str] = {
+    "estagio": "int64",
+    "numero_utes_gnl": "int64",
+    "codigo_submercado": "int64",
+    "indice_lag": "int64",
+    "numero_patamares": "int64",
+}
+GNL_VALUE_DTYPES: Mapping[str, str] = {
+    "estagio": "int64",
+    "posicao_no_bloco": "int64",
+    "valor": "float64",
+}
+SUBMARKET_DTYPES: Mapping[str, str] = {"codigo_submercado": "int64"}
 
 # Descricao de cada escalar do mapcut, para que o CSV de metadados seja
 # autoexplicativo mesmo fora do contexto deste projeto.
@@ -341,6 +371,39 @@ def _travel_time_table(mapcut: Mapcut, logger: logging.Logger) -> pd.DataFrame:
     return pd.DataFrame(rows).astype(dict(TRAVEL_TIME_DTYPES))
 
 
+def _idecomp_gnl_frame_is_evaluable(mapcut: Mapcut) -> bool:
+    """Preve se `Mapcut.dados_gnl` consegue ser avaliada sem levantar excecao.
+
+    ESTE E O UNICO PONTO DO PROJETO QUE ESPELHA DE PROPOSITO UMA ARITMETICA
+    DEFEITUOSA DO IDECOMP (versao 1.14.2). Ele reproduz o passo errado
+    `1 + 4*n + soma(numero_patamares)` apenas para saber se a varredura da
+    propriedade permanece dentro do payload:
+
+    * se permanecer, a propriedade devolve uma tabela - decodificada de forma
+      incorreta, o que e justamente o que a tabela de auditoria
+      `mapcut_gnl_idecomp_bruto` existe para registrar;
+    * se sair do payload, a propriedade levanta `IndexError` e nao ha saida
+      literal alguma para auditar.
+
+    A alternativa seria envolver a propriedade em `except IndexError`, o que
+    mascararia falhas de outra natureza. Prever e conferir e mais estreito.
+
+    Se o `idecomp` for atualizado, esta funcao tem de ser revista junto: ela
+    descreve o comportamento de uma versao especifica, nao um contrato.
+    """
+    raw = raw_data_section(mapcut)["dados_gnl"]
+    stage_count = require_int(mapcut.numero_estagios, "numero_estagios")
+
+    offset = 0
+    for _ in range(stage_count):
+        if offset >= len(raw) or offset < 0:
+            return False
+        plant_count = int(raw[offset])
+        load_blocks = raw[offset + 2 * plant_count + 1 : offset + 3 * plant_count + 1]
+        offset += int(1 + 4 * plant_count + sum(load_blocks))
+    return True
+
+
 def _gnl_tables(
     mapcut: Mapcut, logger: logging.Logger
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -365,64 +428,62 @@ def _gnl_tables(
 
     Returns:
         A tabela de dados de GNL por estagio/submercado e a tabela do bloco de
-        valores reais.
+        valores reais. Ambas vazias, com as colunas declaradas, quando o caso nao
+        tem UTE a GNL.
     """
+    blocks = gnl_stage_blocks(mapcut)
     raw = raw_data_section(mapcut)["dados_gnl"]
     stage_count = require_int(mapcut.numero_estagios, "numero_estagios")
 
     rows: list[dict[str, int]] = []
     value_rows: list[dict[str, float | int]] = []
-    offset = 0
-    for stage in range(1, stage_count + 1):
-        if offset >= len(raw):
-            raise GeometryError(
-                f"o payload de GNL terminou no estagio {stage} de {stage_count}"
-            )
-        plant_count = int(raw[offset])
-        stride = 1 + 3 * plant_count + stage_count * plant_count
-        if offset + stride > len(raw):
-            raise GeometryError(
-                f"o registro de GNL do estagio {stage} exigiria {stride} valores "
-                f"a partir do offset {offset}, mas o payload tem {len(raw)}"
-            )
-        submarkets = [int(v) for v in raw[offset + 1 : offset + 1 + plant_count]]
-        lags = [
-            int(v) for v in raw[offset + 1 + plant_count : offset + 1 + 2 * plant_count]
-        ]
-        load_blocks = [
-            int(v)
-            for v in raw[offset + 1 + 2 * plant_count : offset + 1 + 3 * plant_count]
-        ]
-        for submarket, lag, blocks in zip(submarkets, lags, load_blocks, strict=True):
+    for block in blocks:
+        for submarket, lag, load_blocks in zip(
+            block.submarket_codes,
+            block.lag_indices,
+            block.load_block_counts,
+            strict=True,
+        ):
             rows.append(
                 {
-                    "estagio": stage,
-                    "numero_utes_gnl": plant_count,
+                    "estagio": block.stage,
+                    "numero_utes_gnl": block.plant_count,
                     "codigo_submercado": submarket,
                     "indice_lag": lag,
-                    "numero_patamares": blocks,
+                    "numero_patamares": load_blocks,
                 }
             )
-        value_block = raw[offset + 1 + 3 * plant_count : offset + stride]
+        value_block = raw[block.value_start : block.value_stop]
         for position, value in enumerate(value_block, start=1):
             value_rows.append(
-                {"estagio": stage, "posicao_no_bloco": position, "valor": float(value)}
+                {
+                    "estagio": block.stage,
+                    "posicao_no_bloco": position,
+                    "valor": float(value),
+                }
             )
-        offset += stride
 
-    if offset != len(raw):
-        raise GeometryError(
-            f"a reconstrucao dos dados de GNL consumiu {offset} dos {len(raw)} "
-            "valores do payload. O layout assumido nao corresponde ao arquivo."
-        )
+    # A ausencia de GNL pode chegar de duas formas: payload inteiramente vazio
+    # (nenhum registro 9) ou um registro por estagio declarando zero UTEs. As
+    # duas terminam sem linha alguma, e e por isso que a decisao olha as linhas e
+    # nao os blocos.
+    if not rows:
+        logger.info("sem dados de GNL a reconstruir: o caso nao tem UTE a GNL")
+        return _empty_table(GNL_DTYPES), _empty_table(GNL_VALUE_DTYPES)
+
     logger.info(
         "dados de GNL reconstruidos: %d linhas cobrindo %d estagios; "
-        "o idecomp devolveria %d linhas (apenas o primeiro estagio)",
+        "o idecomp devolveria %s",
         len(rows),
         stage_count,
-        len(require_frame(mapcut.dados_gnl, "dados_gnl")),
+        f"{len(require_frame(mapcut.dados_gnl, 'dados_gnl'))} linhas"
+        if _idecomp_gnl_frame_is_evaluable(mapcut)
+        else "IndexError (a varredura dela sai do payload)",
     )
-    return pd.DataFrame(rows), pd.DataFrame(value_rows)
+    return (
+        pd.DataFrame(rows).astype(dict(GNL_DTYPES)),
+        pd.DataFrame(value_rows).astype(dict(GNL_VALUE_DTYPES)),
+    )
 
 
 def build_mapcut_tables(
@@ -449,6 +510,22 @@ def build_mapcut_tables(
         raw_travel_time = _empty_table(TRAVEL_TIME_DTYPES)
     else:
         raw_travel_time = require_frame(mapcut.dados_tempo_viagem, "dados_tempo_viagem")
+
+    # A saida literal do idecomp para GNL nem sempre existe: quando a varredura
+    # da propriedade sai do payload, ela levanta IndexError e nao ha nada para
+    # auditar. Nesse caso a tabela sai vazia e o log diz por que.
+    if not gnl_table.empty and _idecomp_gnl_frame_is_evaluable(mapcut):
+        raw_gnl = require_frame(mapcut.dados_gnl, "dados_gnl")
+    else:
+        raw_gnl = _empty_table(GNL_DTYPES)
+        if not gnl_table.empty:
+            logger.warning(
+                "a tabela de auditoria mapcut_gnl_idecomp_bruto saiu vazia: a "
+                "propriedade dados_gnl do idecomp levanta IndexError neste caso, "
+                "porque o passo errado dela (1 + 4n + soma(patamares)) sai do "
+                "payload quando o numero de estagios e pequeno. A reconstrucao "
+                "correta esta em mapcut_gnl; nao ha saida literal para comparar."
+            )
     return {
         "mapcut_metadados": _metadata_table(mapcut),
         "mapcut_usinas_hidraulicas": _hydro_plants_table(mapcut, logger),
@@ -461,9 +538,11 @@ def build_mapcut_tables(
         "mapcut_gnl_bloco_valores": gnl_values_table,
         "mapcut_submercados_gnl": pd.DataFrame(
             {"codigo_submercado": list(geometry.gnl_submarket_codes)}
-        ),
+        ).astype(dict(SUBMARKET_DTYPES))
+        if geometry.gnl_submarket_codes
+        else _empty_table(SUBMARKET_DTYPES),
         "mapcut_custos": require_frame(mapcut.dados_custos, "dados_custos"),
         "mapcut_usinas_jusante_idecomp_bruto": _hydro_plants_raw_table(mapcut),
         "mapcut_tempo_viagem_idecomp_bruto": raw_travel_time,
-        "mapcut_gnl_idecomp_bruto": require_frame(mapcut.dados_gnl, "dados_gnl"),
+        "mapcut_gnl_idecomp_bruto": raw_gnl,
     }

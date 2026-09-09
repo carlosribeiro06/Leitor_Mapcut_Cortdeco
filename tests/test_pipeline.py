@@ -39,6 +39,19 @@ TRAVEL_TIME_TABLES = frozenset(
     }
 )
 
+# Idem para o bloco de GNL. A tabela de auditoria entra aqui tambem porque a
+# propriedade do idecomp que a produz nem sempre e avaliavel, mesmo havendo GNL.
+GNL_TABLES = frozenset(
+    {
+        "mapcut_gnl",
+        "mapcut_gnl_bloco_valores",
+        "mapcut_submercados_gnl",
+        "mapcut_gnl_idecomp_bruto",
+        "cortdeco_coef_geracao_gnl",
+        "cortdeco_coef_geracao_gnl_idecomp_bruto",
+    }
+)
+
 
 @pytest.fixture
 def real_workspace(
@@ -72,14 +85,19 @@ def test_execucao_completa_grava_todos_os_csvs(report, real_workspace: Path) -> 
         f"{record.name}.csv" for record in report.exported
     )
     # O conjunto de arquivos gravados nao depende do caso: tabela vazia tambem e
-    # gravada, com cabecalho. Mas so as de tempo de viagem podem estar vazias, e
-    # so quando o caso nao tem UHE com tempo de viagem.
-    esperadas_vazias = (
-        set() if report.geometry.travel_time_plant_codes else set(TRAVEL_TIME_TABLES)
-    )
+    # gravada, com cabecalho. Vazia, porem, so onde a ausencia e legitima - os
+    # dois blocos opcionais do corte e a auditoria que depende deles.
     vazias = {record.name for record in report.exported if record.rows == 0}
 
-    assert vazias == esperadas_vazias
+    assert vazias <= TRAVEL_TIME_TABLES | GNL_TABLES, (
+        "nenhuma tabela obrigatoria pode sair vazia"
+    )
+    if report.geometry.travel_time_plant_codes:
+        assert not vazias & TRAVEL_TIME_TABLES
+    if report.geometry.gnl_submarket_codes:
+        # Havendo GNL, a unica ausencia admissivel e a da tabela de auditoria,
+        # cuja propriedade do idecomp nem sempre pode ser avaliada.
+        assert vazias & GNL_TABLES <= {"mapcut_gnl_idecomp_bruto"}
 
 
 def test_csv_vazio_sai_com_cabecalho_e_gera_aviso(

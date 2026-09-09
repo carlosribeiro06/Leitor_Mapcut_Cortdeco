@@ -92,9 +92,11 @@ def write_tables(
     if vazias:
         logger.warning(
             "%d tabela(s) gravada(s) apenas com o cabecalho, sem nenhuma linha: "
-            "%s. Confirme que a ausencia de dados e esperada para este caso - as "
-            "tabelas de tempo de viagem, por exemplo, ficam legitimamente vazias "
-            "quando o caso nao tem UHE com tempo de viagem da agua.",
+            "%s. Confirme que a ausencia de dados e esperada para este caso - os "
+            "blocos de tempo de viagem e de GNL sao opcionais, e as tabelas de "
+            "auditoria ficam vazias quando a propriedade correspondente do "
+            "idecomp nao e avaliavel. As linhas anteriores do log dizem qual e o "
+            "motivo de cada uma.",
             len(vazias),
             ", ".join(vazias),
         )

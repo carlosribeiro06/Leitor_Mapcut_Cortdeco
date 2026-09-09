@@ -20,15 +20,23 @@ from idecomp.decomp.mapcut import Mapcut
 
 from conftest import (
     SYNTHETIC_COEFFICIENT_COUNT,
+    SYNTHETIC_COEFFICIENT_COUNT_GNL_MAIOR,
+    SYNTHETIC_COEFFICIENT_COUNT_WITHOUT_GNL,
     SYNTHETIC_COEFFICIENT_COUNT_WITHOUT_TRAVEL_TIME,
     SYNTHETIC_CUTS_PER_NODE,
+    SYNTHETIC_GNL_SUBMARKET_CODES,
+    SYNTHETIC_GNL_SUBMARKET_CODES_MAIOR,
+    SYNTHETIC_LOAD_BLOCKS,
+    SYNTHETIC_LOAD_BLOCKS_MAIOR,
     SYNTHETIC_MAX_TRAVEL_TIME_LAG,
     SYNTHETIC_RECORD_SIZE,
+    SYNTHETIC_STAGES,
     SYNTHETIC_TOTAL_RECORDS,
     SYNTHETIC_TRAVEL_TIME_HOURS,
     SYNTHETIC_TRAVEL_TIME_PLANT_CODES,
     SYNTHETIC_TRAVEL_TIME_STAGE_LAGS,
     FakeMapcut,
+    synthetic_gnl_payload,
     write_synthetic_cortdeco,
 )
 from leitor_mapcut_cortdeco.config import CortdecoSettings
@@ -37,10 +45,19 @@ from leitor_mapcut_cortdeco.geometry import (
     GeometryError,
     build_cut_geometry,
     downstream_plant_indices,
+    gnl_stage_blocks,
+    gnl_submarket_codes,
     travel_time_blocks,
     travel_time_lags,
     travel_time_plant_codes,
+    travel_time_register_counts,
     validate_geometry,
+)
+from leitor_mapcut_cortdeco.mapcut_reader import (
+    # Helper privado, importado de proposito: e ele que reproduz a aritmetica
+    # defeituosa do idecomp, e o teste de regressao precisa provar que a condicao
+    # de falha esta de fato montada, e nao apenas que o resultado saiu certo.
+    _idecomp_gnl_frame_is_evaluable,
 )
 
 DEFAULT_CORTDECO_SETTINGS = CortdecoSettings(
@@ -336,3 +353,188 @@ def test_numero_de_uhes_com_tempo_viagem_negativo(fake_mapcut: FakeMapcut) -> No
 
     with pytest.raises(GeometryError, match="negativo"):
         travel_time_plant_codes(_mapcut(fake_mapcut))
+
+
+def test_leitura_desalinhada_da_seccao_de_tempo_viagem_interrompe(
+    fake_mapcut: FakeMapcut, synthetic_cortdeco: Path, quiet_logger: logging.Logger
+) -> None:
+    """Lags nao uniformes desalinham TODOS os registros seguintes do mapcut.
+
+    O idecomp indexa o vetor de lags por (usina * estagio), e nao por
+    (usina - 1) * numero_estagios + estagio. Com dois lags diferentes ele le um
+    numero errado de registros de 48 KB, e os registros de GNL e de custos passam
+    a ser lidos de outro trecho do arquivo - sem excecao e sem sintoma. A
+    geometria tem de parar antes de derivar qualquer coisa desses payloads.
+    """
+    fake_mapcut.numero_uhes_tempo_viagem = 2
+    fake_mapcut.lag_tempo_viagem_por_uhe = [1, 1, 1, 2, 2, 2]
+
+    actual, consumed = travel_time_register_counts(_mapcut(fake_mapcut))
+    assert (actual, consumed) == (15, 14)
+
+    with pytest.raises(GeometryError, match="registros de tempo de viagem"):
+        _build(fake_mapcut, synthetic_cortdeco, quiet_logger)
+
+
+def test_leitura_alinhada_quando_os_lags_sao_uniformes(
+    fake_mapcut: FakeMapcut,
+) -> None:
+    """O caso comum: lags iguais fazem as duas indexacoes coincidirem."""
+    actual, consumed = travel_time_register_counts(_mapcut(fake_mapcut))
+
+    assert actual == consumed
+    assert actual == sum(lag + 1 for lag in SYNTHETIC_TRAVEL_TIME_STAGE_LAGS)
+
+
+# ---------------------------------------------------------------------------
+# Geracao GNL antecipada
+# ---------------------------------------------------------------------------
+
+
+def test_submercados_de_gnl_vem_do_payload_bruto(fake_mapcut: FakeMapcut) -> None:
+    """Os codigos sao decodificados do registro 9, nao da propriedade."""
+    blocks = gnl_stage_blocks(_mapcut(fake_mapcut))
+
+    assert len(blocks) == SYNTHETIC_STAGES
+    assert [block.stage for block in blocks] == list(range(1, SYNTHETIC_STAGES + 1))
+    for block in blocks:
+        assert block.plant_count == len(SYNTHETIC_GNL_SUBMARKET_CODES)
+        assert block.submarket_codes == SYNTHETIC_GNL_SUBMARKET_CODES
+        assert block.load_block_counts == (SYNTHETIC_LOAD_BLOCKS,)
+    # Os codigos se repetem a cada estagio e sao reduzidos preservando a ordem.
+    assert gnl_submarket_codes(_mapcut(fake_mapcut)) == SYNTHETIC_GNL_SUBMARKET_CODES
+
+
+def test_propriedade_de_gnl_do_idecomp_nao_e_consultada(
+    fake_mapcut: FakeMapcut, synthetic_cortdeco: Path, quiet_logger: logging.Logger
+) -> None:
+    """O duble levanta em `codigos_submercados_gnl`; a geometria tem de passar."""
+    with pytest.raises(IndexError):
+        _ = fake_mapcut.codigos_submercados_gnl
+
+    geometry = _build(fake_mapcut, synthetic_cortdeco, quiet_logger)
+
+    assert geometry.gnl_submarket_codes == SYNTHETIC_GNL_SUBMARKET_CODES
+
+
+def test_caso_sem_gnl_produz_bloco_de_largura_zero(
+    fake_mapcut_sem_gnl: FakeMapcut,
+    synthetic_cortdeco_sem_gnl: Path,
+    quiet_logger: logging.Logger,
+) -> None:
+    """Nenhuma UTE a GNL e caso legitimo: o corte vai do tempo de viagem ao fim."""
+    geometry = _build(fake_mapcut_sem_gnl, synthetic_cortdeco_sem_gnl, quiet_logger)
+
+    assert geometry.gnl_submarket_codes == ()
+    assert geometry.gnl_coefficient_count == 0
+    assert geometry.coefficient_count == SYNTHETIC_COEFFICIENT_COUNT_WITHOUT_GNL
+    assert geometry.travel_time_coefficient_count == 2
+
+    validate_geometry(geometry, synthetic_cortdeco_sem_gnl, quiet_logger)
+
+
+def test_payload_de_gnl_inteiramente_vazio_tambem_e_aceito(
+    fake_mapcut_sem_gnl: FakeMapcut,
+) -> None:
+    """A outra forma possivel do caso sem GNL: nenhum registro 9 no payload."""
+    fake_mapcut_sem_gnl.data.section.data["dados_gnl"] = []
+
+    assert gnl_stage_blocks(_mapcut(fake_mapcut_sem_gnl)) == []
+    assert gnl_submarket_codes(_mapcut(fake_mapcut_sem_gnl)) == ()
+
+
+def test_payload_de_gnl_com_sobra(fake_mapcut: FakeMapcut) -> None:
+    """Sobra no payload significa que o layout assumido nao corresponde."""
+    fake_mapcut.data.section.data["dados_gnl"] += [0]
+
+    with pytest.raises(GeometryError, match="nao corresponde"):
+        gnl_stage_blocks(_mapcut(fake_mapcut))
+
+
+def test_payload_de_gnl_acaba_antes_do_ultimo_estagio(
+    fake_mapcut: FakeMapcut,
+) -> None:
+    """Payload que termina em fronteira de registro, faltando estagios."""
+    completo = synthetic_gnl_payload()
+    por_estagio = len(completo) // SYNTHETIC_STAGES
+    fake_mapcut.data.section.data["dados_gnl"] = completo[: 2 * por_estagio]
+
+    with pytest.raises(GeometryError, match="acabou no estagio 3 de 3"):
+        gnl_stage_blocks(_mapcut(fake_mapcut))
+
+
+def test_registro_de_gnl_nao_cabe_no_payload(fake_mapcut: FakeMapcut) -> None:
+    """Payload que termina no meio de um registro."""
+    fake_mapcut.data.section.data["dados_gnl"] = synthetic_gnl_payload(stage_count=1)
+
+    with pytest.raises(GeometryError, match="exigiria 7 valores"):
+        gnl_stage_blocks(_mapcut(fake_mapcut))
+
+
+def test_mais_submercados_com_gnl_que_submercados_do_caso(
+    fake_mapcut: FakeMapcut,
+) -> None:
+    """Mais submercados distintos que o caso tem denuncia layout errado."""
+    fake_mapcut.numero_submercados = 1
+    fake_mapcut.data.section.data["dados_gnl"] = synthetic_gnl_payload(
+        submarket_codes=(1, 3)
+    )
+
+    with pytest.raises(GeometryError, match="mais do que os 1 submercados"):
+        gnl_submarket_codes(_mapcut(fake_mapcut))
+
+
+def test_poucos_estagios_derrubam_o_idecomp_mas_nao_a_leitura(
+    fake_mapcut_gnl_maior: FakeMapcut,
+    synthetic_cortdeco_gnl_maior: Path,
+    quiet_logger: logging.Logger,
+) -> None:
+    """Regressao do deck rv4: passo errado do idecomp saindo do payload.
+
+    Com poucos estagios e mais de um submercado, o passo errado da biblioteca cai
+    no meio do registro seguinte e depois estoura o payload - a propriedade
+    levanta IndexError. A leitura nao pode depender dela, e a geometria tem de
+    sair com o numero certo de submercados.
+    """
+    mapcut = _mapcut(fake_mapcut_gnl_maior)
+
+    # A condicao esta de fato reproduzida: a propriedade nao e avaliavel.
+    assert not _idecomp_gnl_frame_is_evaluable(mapcut)
+    with pytest.raises(IndexError):
+        _ = fake_mapcut_gnl_maior.codigos_submercados_gnl
+
+    # E, apesar disso, a derivacao do payload bruto entrega o resultado certo.
+    assert gnl_submarket_codes(mapcut) == SYNTHETIC_GNL_SUBMARKET_CODES_MAIOR
+
+    geometry = _build(fake_mapcut_gnl_maior, synthetic_cortdeco_gnl_maior, quiet_logger)
+
+    assert geometry.gnl_submarket_codes == SYNTHETIC_GNL_SUBMARKET_CODES_MAIOR
+    assert geometry.gnl_coefficient_count == (
+        len(SYNTHETIC_GNL_SUBMARKET_CODES_MAIOR)
+        * SYNTHETIC_STAGES
+        * SYNTHETIC_LOAD_BLOCKS_MAIOR
+    )
+    assert geometry.coefficient_count == SYNTHETIC_COEFFICIENT_COUNT_GNL_MAIOR
+
+    validate_geometry(geometry, synthetic_cortdeco_gnl_maior, quiet_logger)
+
+
+def test_passo_do_idecomp_coincide_no_caso_sintetico_padrao(
+    fake_mapcut: FakeMapcut,
+) -> None:
+    """Contraprova: com nper == patamares + 1 os dois passos coincidem.
+
+    Serve para provar que o teste acima mede a condicao certa, e nao um efeito
+    colateral do duble.
+    """
+    assert SYNTHETIC_STAGES == SYNTHETIC_LOAD_BLOCKS + 1
+    assert _idecomp_gnl_frame_is_evaluable(_mapcut(fake_mapcut))
+
+
+def test_submercado_repetido_no_mesmo_estagio(fake_mapcut: FakeMapcut) -> None:
+    fake_mapcut.data.section.data["dados_gnl"] = synthetic_gnl_payload(
+        submarket_codes=(1, 1)
+    )
+
+    with pytest.raises(GeometryError, match="repete submercados"):
+        gnl_submarket_codes(_mapcut(fake_mapcut))

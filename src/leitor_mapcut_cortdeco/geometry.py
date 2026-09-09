@@ -27,14 +27,25 @@ As tres verificacoes de integridade
    algum byte do preenchimento for diferente de zero, a contagem de coeficientes
    esta subestimada e a leitura estaria truncando dados reais.
 
-Bloco de tempo de viagem opcional
----------------------------------
-Um caso pode nao ter nenhuma UHE com tempo de viagem da agua. Nesse caso
-`numero_uhes_tempo_viagem` e zero, os registros 7 e 8 do mapcut nao existem e o
-bloco de coeficientes de defluencia passada tem largura zero dentro do corte -
-tudo isso e legitimo, e nao sinal de arquivo corrompido. Como o `idecomp` 1.14.2
-nao trata esse caso, os dados de tempo de viagem sao derivados aqui do payload
-bruto; veja a secao "Tempo de viagem da agua" mais abaixo.
+Blocos opcionais do corte
+-------------------------
+Dois dos tres blocos de coeficientes podem ter largura zero, e ambos os casos sao
+legitimos - nao sinal de arquivo corrompido:
+
+* **tempo de viagem** - `numero_uhes_tempo_viagem` igual a zero, e os registros 7
+  e 8 do mapcut nao existem;
+* **geracao GNL** - nenhuma UTE a GNL no caso, e o registro 9 nao traz submercado
+  algum.
+
+O `idecomp` 1.14.2 nao trata nenhum dos dois, e as propriedades correspondentes
+levantam excecao ou devolvem valores de outro campo. Por isso os dois blocos sao
+derivados aqui do payload bruto; veja as secoes "Tempo de viagem da agua" e
+"Geracao GNL antecipada" mais abaixo.
+
+Como os codigos decodificados dimensionam os blocos de coeficientes do corte, um
+erro neles desloca todo o layout em silencio - motivo pelo qual cada derivacao
+exige que os blocos consumam o payload inteiro e confere os codigos contra os
+escalares declarados pelo caso.
 
 Numero de cortes por no
 -----------------------
@@ -409,6 +420,201 @@ def travel_time_plant_codes(mapcut: Mapcut) -> tuple[int, ...]:
     return codes
 
 
+def travel_time_register_counts(mapcut: Mapcut) -> tuple[int, int]:
+    """Registros de tempo de viagem que existem, e os que o idecomp consome.
+
+    A seccao de tempo de viagem ocupa um registro de 48020 bytes por cada lag de
+    cada par usina/estagio. O `idecomp` decide quantos registros ler indexando o
+    vetor de lags por `(usina * estagio) - 1`, quando o indice correto seria
+    `(usina - 1) * numero_estagios + estagio - 1`. As duas formulas coincidem
+    apenas quando todos os lags sao iguais - o caso mais comum, e o unico
+    observado ate agora.
+
+    Quando nao coincidem, o `idecomp` para de ler a seccao no lugar errado e
+    **todos os registros seguintes saem de posicao**: os registros 9 e 10, isto e
+    os dados de GNL e de custos, passam a ser lidos de outro trecho do arquivo.
+    Nada nisso levanta excecao, e nenhum numero derivado desses payloads e
+    confiavel - por isso a divergencia e tratada como erro em
+    `build_cut_geometry`.
+
+    Returns:
+        O par (registros existentes, registros que o idecomp le). Vale (0, 0)
+        quando o caso nao tem UHE com tempo de viagem.
+    """
+    count = travel_time_plant_count(mapcut)
+    if count == 0:
+        return (0, 0)
+
+    stage_count = require_int(mapcut.numero_estagios, "numero_estagios")
+    lags = travel_time_lags(mapcut)
+
+    actual = sum(
+        lags[plant * stage_count + stage] + 1
+        for plant in range(count)
+        for stage in range(stage_count)
+    )
+    consumed = 0
+    for plant in range(1, count + 1):
+        for stage in range(1, stage_count + 1):
+            index = plant * stage - 1
+            if 0 <= index < len(lags):
+                consumed += lags[index] + 1
+    return (actual, consumed)
+
+
+# ---------------------------------------------------------------------------
+# Geracao GNL antecipada
+#
+# O registro 9 do mapcut traz, por estagio:
+#
+#     [numero_utes_gnl,
+#      codigo_submercado x n, indice_lag x n, numero_patamares x n,  (int32)
+#      valores x (numero_estagios * n)]                             (float64)
+#
+# O passo entre estagios e portanto `1 + 3*n + numero_estagios*n`. O `idecomp`
+# usa `1 + 4*n + soma(numero_patamares)`, que nao coincide com o verdadeiro em
+# nenhum dos decks observados, e o efeito depende do tamanho do payload:
+#
+# * com muitos estagios o passo errado e MENOR que o verdadeiro, o offset avanca
+#   devagar, permanece dentro do payload e decodifica lixo sem levantar excecao -
+#   apenas o primeiro estagio sai correto;
+# * com poucos estagios o payload e curto, o offset cai no meio de um registro,
+#   le um codigo de submercado como se fosse `numero_utes_gnl` e toma reais do
+#   bloco de valores como se fossem patamares. O passo resultante estoura o
+#   payload e a propriedade levanta `IndexError`.
+#
+# Por isso os dados de GNL - inclusive os codigos de submercado que dimensionam o
+# bloco de coeficientes do corte - sao derivados aqui do payload bruto.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class GnlStageBlock:
+    """O registro de GNL de um estagio dentro do payload do registro 9.
+
+    Attributes:
+        stage: estagio a que o registro pertence, comecando em 1.
+        plant_count: numero de UTEs a GNL declarado no registro.
+        submarket_codes: codigo do submercado de cada UTE, na ordem do payload.
+        lag_indices: indice de lag (antecipacao do despacho) de cada UTE.
+        load_block_counts: numero de patamares de cada UTE.
+        value_start: posicao, no payload, do primeiro real do bloco de valores.
+        value_stop: posicao imediatamente apos o ultimo valor do registro.
+    """
+
+    stage: int
+    plant_count: int
+    submarket_codes: tuple[int, ...]
+    lag_indices: tuple[int, ...]
+    load_block_counts: tuple[int, ...]
+    value_start: int
+    value_stop: int
+
+
+def gnl_stage_blocks(mapcut: Mapcut) -> list[GnlStageBlock]:
+    """Localiza os registros de GNL no payload bruto, um por estagio.
+
+    Exigir que os registros consumam o payload inteiro e o que confere, por uma
+    via independente, que o passo verdadeiro e o layout assumido concordam.
+
+    Returns:
+        Um bloco por estagio; lista vazia quando o caso nao tem UTE a GNL.
+
+    Raises:
+        GeometryError: o payload termina antes do previsto, sobram valores depois
+            do ultimo estagio, ou um registro declara contagem negativa.
+    """
+    raw = raw_data_section(mapcut)["dados_gnl"]
+    stage_count = require_int(mapcut.numero_estagios, "numero_estagios")
+    if not raw:
+        return []
+
+    blocks: list[GnlStageBlock] = []
+    offset = 0
+    for stage in range(1, stage_count + 1):
+        if offset >= len(raw):
+            raise GeometryError(
+                f"o payload de GNL acabou no estagio {stage} de {stage_count}: o "
+                f"registro comecaria em {offset} e o payload tem {len(raw)} valores"
+            )
+        plant_count = int(raw[offset])
+        if plant_count < 0:
+            raise GeometryError(
+                f"o registro de GNL do estagio {stage} declara {plant_count} UTEs"
+            )
+        stride = 1 + 3 * plant_count + stage_count * plant_count
+        if offset + stride > len(raw):
+            raise GeometryError(
+                f"o registro de GNL do estagio {stage} exigiria {stride} valores a "
+                f"partir do offset {offset}, mas o payload tem {len(raw)}"
+            )
+        first = offset + 1
+        blocks.append(
+            GnlStageBlock(
+                stage=stage,
+                plant_count=plant_count,
+                submarket_codes=tuple(int(v) for v in raw[first : first + plant_count]),
+                lag_indices=tuple(
+                    int(v) for v in raw[first + plant_count : first + 2 * plant_count]
+                ),
+                load_block_counts=tuple(
+                    int(v)
+                    for v in raw[first + 2 * plant_count : first + 3 * plant_count]
+                ),
+                value_start=first + 3 * plant_count,
+                value_stop=offset + stride,
+            )
+        )
+        offset += stride
+
+    if offset != len(raw):
+        raise GeometryError(
+            f"a leitura dos registros de GNL consumiu {offset} dos {len(raw)} "
+            "valores do payload. O layout assumido nao corresponde ao arquivo."
+        )
+    return blocks
+
+
+def gnl_submarket_codes(mapcut: Mapcut) -> tuple[int, ...]:
+    """Codigos dos submercados com despacho antecipado de GNL.
+
+    Os codigos aparecem repetidos, um conjunto por estagio; aqui eles sao
+    reduzidos preservando a ordem de primeira ocorrencia, que e a ordem em que os
+    coeficientes de GNL aparecem dentro do corte.
+
+    Returns:
+        Tupla vazia quando o caso nao tem UTE a GNL.
+
+    Raises:
+        GeometryError: um estagio repete o mesmo submercado, ou o total de
+            submercados distintos excede `numero_submercados` do caso.
+    """
+    blocks = gnl_stage_blocks(mapcut)
+    if not blocks:
+        return ()
+
+    codes: list[int] = []
+    for block in blocks:
+        if len(set(block.submarket_codes)) != len(block.submarket_codes):
+            raise GeometryError(
+                f"o registro de GNL do estagio {block.stage} repete submercados "
+                f"({list(block.submarket_codes)}). O layout assumido para o "
+                "registro 9 nao corresponde ao arquivo."
+            )
+        for code in block.submarket_codes:
+            if code not in codes:
+                codes.append(code)
+
+    submarket_count = require_int(mapcut.numero_submercados, "numero_submercados")
+    if len(codes) > submarket_count:
+        raise GeometryError(
+            f"foram decodificados {len(codes)} submercados com GNL ({sorted(codes)}), "
+            f"mais do que os {submarket_count} submercados do caso. O layout "
+            "assumido para o registro 9 nao corresponde ao arquivo."
+        )
+    return tuple(codes)
+
+
 def _uniform_load_blocks(load_blocks_per_stage: list[int]) -> int:
     """Reduz os patamares por estagio a um unico valor, exigindo uniformidade.
 
@@ -506,6 +712,27 @@ def _resolve_cuts_per_node(
     return from_iterations, "numero_iteracoes"
 
 
+def _require_travel_time_register_alignment(mapcut: Mapcut) -> None:
+    """Interrompe a execucao se o idecomp leu a seccao de tempo de viagem torta.
+
+    Ver `travel_time_register_counts`: quando as duas contagens divergem, os
+    payloads de GNL e de custos vieram de posicoes erradas do arquivo. Parar aqui
+    e obrigatorio, porque nada a jusante consegue detectar isso - os numeros saem
+    plausiveis e errados.
+    """
+    actual, consumed = travel_time_register_counts(mapcut)
+    if actual != consumed:
+        raise GeometryError(
+            f"o idecomp leria {consumed} registros de tempo de viagem, mas o "
+            f"arquivo tem {actual}. Isso acontece quando os lags nao sao todos "
+            "iguais, porque a biblioteca indexa o vetor de lags por "
+            "(usina * estagio) em vez de (usina - 1) * numero_estagios + estagio. "
+            "Com a leitura desalinhada, os registros de GNL e de custos foram "
+            "lidos de outro trecho do arquivo e nenhum valor derivado deles e "
+            "confiavel. Este caso exige correcao no leitor antes de prosseguir."
+        )
+
+
 def build_cut_geometry(
     mapcut: Mapcut,
     cortdeco_path: Path,
@@ -526,8 +753,11 @@ def build_cut_geometry(
 
     Raises:
         GeometryError: mapcut incompleto, patamares nao uniformes entre estagios,
-            ou tamanho de arquivo incompativel com o tamanho do registro.
+            tamanho de arquivo incompativel com o tamanho do registro, ou
+            desalinhamento na leitura dos registros de tempo de viagem.
     """
+    _require_travel_time_register_alignment(mapcut)
+
     record_size_bytes = require_int(mapcut.tamanho_corte, "tamanho_corte")
     if record_size_bytes <= 0:
         raise GeometryError(
@@ -574,12 +804,7 @@ def build_cut_geometry(
             int(c) for c in require_list(mapcut.codigos_uhes, "codigos_uhes")
         ),
         travel_time_plant_codes=travel_time_plant_codes(mapcut),
-        gnl_submarket_codes=tuple(
-            int(c)
-            for c in require_list(
-                mapcut.codigos_submercados_gnl, "codigos_submercados_gnl"
-            )
-        ),
+        gnl_submarket_codes=gnl_submarket_codes(mapcut),
         cuts_per_node=cuts_per_node,
         cuts_per_node_from_iterations=cuts_per_node_from_iterations,
         cuts_per_node_from_file=cuts_per_node_from_file,
@@ -600,6 +825,11 @@ def _log_geometry(geometry: CutGeometry, logger: logging.Logger) -> None:
             "o caso nao tem UHE com tempo de viagem da agua "
             "(numero_uhes_tempo_viagem = 0): o bloco de coeficientes de "
             "defluencia passada nao existe dentro do corte"
+        )
+    if not geometry.gnl_submarket_codes:
+        logger.info(
+            "o caso nao tem UTE a GNL: o bloco de coeficientes de geracao "
+            "antecipada nao existe dentro do corte"
         )
     logger.info(
         "geometria do corte: %d bytes por registro, %d coeficientes uteis "

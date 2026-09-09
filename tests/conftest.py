@@ -23,6 +23,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from leitor_mapcut_cortdeco.config import load_settings
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 # Dimensoes do caso sintetico. Sao pequenas de proposito, para que o arquivo
@@ -53,6 +55,30 @@ SYNTHETIC_COEFFICIENT_COUNT_WITHOUT_TRAVEL_TIME = 9
 # a `[0:]` e entrega a lista `dados_estagios` inteira. O duble reproduz isso para
 # que os testes provem que o codigo de producao nao consome esse vetor.
 SYNTHETIC_BOGUS_TRAVEL_TIME_LAGS = (1, 3, 6, 0, 0, 1, 2, 3)
+
+# GNL do caso sintetico: um submercado, com a mesma antecipacao em todos os
+# estagios. O payload do registro 9 e montado a partir daqui.
+SYNTHETIC_GNL_LAG = 2
+SYNTHETIC_SUBMARKET_COUNT = 2
+
+# O mesmo caso, mas sem nenhuma UTE a GNL: sobram
+# 1 rhs + 2 volume armazenado + 1 UHE x 2 lags de tempo de viagem.
+SYNTHETIC_COEFFICIENT_COUNT_WITHOUT_GNL = 5
+
+# Caso de GNL com dois submercados e tres patamares. Existe para reproduzir a
+# condicao em que o passo errado do idecomp SAI do payload: o passo verdadeiro
+# (1 + 3n + nper*n) e o dele (1 + 4n + soma(patamares)) coincidem apenas quando
+# nper == numero_patamares + 1, o que vale no sintetico padrao (3 == 2 + 1) mas
+# nao aqui (3 != 3 + 1). Com dois submercados o offset dele cai no meio do
+# registro seguinte, le um codigo de submercado como se fosse a contagem de UTEs
+# e toma reais do bloco de valores como se fossem patamares.
+SYNTHETIC_GNL_SUBMARKET_CODES_MAIOR = (1, 3)
+SYNTHETIC_LOAD_BLOCKS_MAIOR = 3
+
+# 1 rhs + 2 volume armazenado + 1 UHE x 2 lags + 2 submercados x 3 estagios x 3
+# patamares. Nao cabe no registro de 128 bytes do sintetico padrao.
+SYNTHETIC_COEFFICIENT_COUNT_GNL_MAIOR = 23
+SYNTHETIC_RECORD_SIZE_GNL_MAIOR = 256
 
 # Encadeamento dos registros (1-based) de cada no, na ordem em que sao lidos.
 # O no 1 (estagio 1) tem 3 cortes; o no 2 (estagio 2) tem 4, porque e o ultimo
@@ -89,15 +115,59 @@ class FakeMapcut:
     numero_iteracoes: int
     numero_cortes: int
     numero_estagios: int
+    numero_submercados: int
     patamares_por_estagio: list[int]
     numero_uhes_tempo_viagem: int
     maximo_lag_tempo_viagem: int
     lag_tempo_viagem_por_uhe: list[int]
     codigos_uhes: list[int]
-    codigos_submercados_gnl: list[int]
     registro_ultimo_corte_no: pd.DataFrame
     codigos_uhes_jusante: list[Any]
     data: FakeSectionFile
+
+    @property
+    def codigos_submercados_gnl(self) -> list[int]:
+        """Tripwire: o codigo de producao nao pode consultar esta propriedade.
+
+        Mesma razao de `codigos_uhes_tempo_viagem`: a propriedade do idecomp
+        derruba a leitura (levanta `IndexError` quando o passo errado dela sai do
+        payload) ou devolve lixo silencioso (so o primeiro estagio decodificado).
+        Os codigos passaram a vir do payload bruto, e o duble levanta sempre para
+        que qualquer reincidencia apareca como falha de teste.
+        """
+        raise IndexError("list index out of range")
+
+    @property
+    def dados_tempo_viagem(self) -> pd.DataFrame:
+        """Saida bruta do idecomp, so para a contagem que vai ao log.
+
+        O codigo de producao consulta esta propriedade em um unico lugar: a linha
+        de log que compara quantas linhas a reconstrucao produziu com quantas a
+        biblioteca produziria. O duble nao reproduz o defeito de acumulador - o
+        numero de linhas aqui e arbitrario e nenhum teste depende dele.
+        """
+        return pd.DataFrame(
+            {
+                "codigo_usina": [SYNTHETIC_TRAVEL_TIME_PLANT_CODES[0]],
+                "numero_horas": [SYNTHETIC_TRAVEL_TIME_HOURS],
+                "estagio": [1],
+                "indice_lag": [0],
+                "coeficiente_amortecimento": [1.0],
+            }
+        )
+
+    @property
+    def dados_gnl(self) -> pd.DataFrame:
+        """Idem, para o bloco de GNL: existe apenas para a contagem do log."""
+        return pd.DataFrame(
+            {
+                "estagio": [1],
+                "numero_utes_gnl": [1],
+                "codigo_submercado": [SYNTHETIC_GNL_SUBMARKET_CODES[0]],
+                "indice_lag": [SYNTHETIC_GNL_LAG],
+                "numero_patamares": [SYNTHETIC_LOAD_BLOCKS],
+            }
+        )
 
     @property
     def codigos_uhes_tempo_viagem(self) -> list[int]:
@@ -130,6 +200,34 @@ def synthetic_last_cut_table() -> pd.DataFrame:
     )
 
 
+def synthetic_gnl_payload(
+    stage_count: int = SYNTHETIC_STAGES,
+    submarket_codes: tuple[int, ...] = SYNTHETIC_GNL_SUBMARKET_CODES,
+    load_blocks: int = SYNTHETIC_LOAD_BLOCKS,
+) -> list[Any]:
+    """Payload do registro 9 do mapcut: um registro por estagio.
+
+    Layout de cada registro:
+    `[numero_utes_gnl, codigo_submercado x n, indice_lag x n,
+      numero_patamares x n, valores x (numero_estagios * n)]`.
+
+    Os parametros ficam abertos porque o passo verdadeiro
+    (`1 + 3n + nper*n`) e o passo errado do idecomp
+    (`1 + 4n + soma(patamares)`) coincidem exatamente quando
+    `nper == numero_patamares + 1` - o caso do sintetico padrao. Para exercitar a
+    divergencia e preciso montar um payload com outras dimensoes.
+    """
+    count = len(submarket_codes)
+    payload: list[Any] = []
+    for stage in range(1, stage_count + 1):
+        payload.append(count)
+        payload += list(submarket_codes)
+        payload += [SYNTHETIC_GNL_LAG] * count
+        payload += [load_blocks] * count
+        payload += [float(stage * 100 + i) for i in range(stage_count * count)]
+    return payload
+
+
 def synthetic_travel_time_payload() -> list[Any]:
     """Payload dos registros 7 e 8 para a unica UHE com tempo de viagem.
 
@@ -156,18 +254,23 @@ def fake_mapcut() -> FakeMapcut:
         numero_iteracoes=SYNTHETIC_CUTS_PER_NODE,
         numero_cortes=SYNTHETIC_CUTS_PER_NODE * 2,
         numero_estagios=SYNTHETIC_STAGES,
+        numero_submercados=SYNTHETIC_SUBMARKET_COUNT,
         patamares_por_estagio=[SYNTHETIC_LOAD_BLOCKS] * SYNTHETIC_STAGES,
         numero_uhes_tempo_viagem=len(SYNTHETIC_TRAVEL_TIME_PLANT_CODES),
         maximo_lag_tempo_viagem=SYNTHETIC_MAX_TRAVEL_TIME_LAG,
         lag_tempo_viagem_por_uhe=list(SYNTHETIC_TRAVEL_TIME_STAGE_LAGS),
         codigos_uhes=list(SYNTHETIC_PLANT_CODES),
-        codigos_submercados_gnl=list(SYNTHETIC_GNL_SUBMARKET_CODES),
         registro_ultimo_corte_no=synthetic_last_cut_table(),
         # Topologia gravada como int32 e lida como float32, tal como o idecomp faz:
         # a usina 1 deflui para a posicao 2 e a usina 2 nao tem jusante.
         codigos_uhes_jusante=list(np.array([2, 0], dtype=np.int32).view(np.float32)),
         data=FakeSectionFile(
-            FakeSection({"dados_tempo_viagem": synthetic_travel_time_payload()})
+            FakeSection(
+                {
+                    "dados_tempo_viagem": synthetic_travel_time_payload(),
+                    "dados_gnl": synthetic_gnl_payload(),
+                }
+            )
         ),
     )
 
@@ -186,15 +289,90 @@ def fake_mapcut_sem_tempo_viagem() -> FakeMapcut:
         numero_iteracoes=SYNTHETIC_CUTS_PER_NODE,
         numero_cortes=SYNTHETIC_CUTS_PER_NODE * 2,
         numero_estagios=SYNTHETIC_STAGES,
+        numero_submercados=SYNTHETIC_SUBMARKET_COUNT,
         patamares_por_estagio=[SYNTHETIC_LOAD_BLOCKS] * SYNTHETIC_STAGES,
         numero_uhes_tempo_viagem=0,
         maximo_lag_tempo_viagem=0,
         lag_tempo_viagem_por_uhe=list(SYNTHETIC_BOGUS_TRAVEL_TIME_LAGS),
         codigos_uhes=list(SYNTHETIC_PLANT_CODES),
-        codigos_submercados_gnl=list(SYNTHETIC_GNL_SUBMARKET_CODES),
         registro_ultimo_corte_no=synthetic_last_cut_table(),
         codigos_uhes_jusante=list(np.array([2, 0], dtype=np.int32).view(np.float32)),
-        data=FakeSectionFile(FakeSection({"dados_tempo_viagem": []})),
+        data=FakeSectionFile(
+            FakeSection(
+                {
+                    "dados_tempo_viagem": [],
+                    "dados_gnl": synthetic_gnl_payload(),
+                }
+            )
+        ),
+    )
+
+
+@pytest.fixture
+def fake_mapcut_gnl_maior() -> FakeMapcut:
+    """Mapcut sintetico em que o passo errado do idecomp sai do payload.
+
+    E a condicao do deck rv4: poucos estagios e mais de um submercado com GNL.
+    Nesse caso `Mapcut.dados_gnl` levanta `IndexError`, e a leitura tem de
+    continuar funcionando porque nao depende dela.
+    """
+    return FakeMapcut(
+        tamanho_corte=SYNTHETIC_RECORD_SIZE_GNL_MAIOR,
+        numero_iteracoes=SYNTHETIC_CUTS_PER_NODE,
+        numero_cortes=SYNTHETIC_CUTS_PER_NODE * 2,
+        numero_estagios=SYNTHETIC_STAGES,
+        numero_submercados=SYNTHETIC_SUBMARKET_COUNT,
+        patamares_por_estagio=[SYNTHETIC_LOAD_BLOCKS_MAIOR] * SYNTHETIC_STAGES,
+        numero_uhes_tempo_viagem=len(SYNTHETIC_TRAVEL_TIME_PLANT_CODES),
+        maximo_lag_tempo_viagem=SYNTHETIC_MAX_TRAVEL_TIME_LAG,
+        lag_tempo_viagem_por_uhe=list(SYNTHETIC_TRAVEL_TIME_STAGE_LAGS),
+        codigos_uhes=list(SYNTHETIC_PLANT_CODES),
+        registro_ultimo_corte_no=synthetic_last_cut_table(),
+        codigos_uhes_jusante=list(np.array([2, 0], dtype=np.int32).view(np.float32)),
+        data=FakeSectionFile(
+            FakeSection(
+                {
+                    "dados_tempo_viagem": synthetic_travel_time_payload(),
+                    "dados_gnl": synthetic_gnl_payload(
+                        submarket_codes=SYNTHETIC_GNL_SUBMARKET_CODES_MAIOR,
+                        load_blocks=SYNTHETIC_LOAD_BLOCKS_MAIOR,
+                    ),
+                }
+            )
+        ),
+    )
+
+
+@pytest.fixture
+def fake_mapcut_sem_gnl() -> FakeMapcut:
+    """Mapcut sintetico de um caso sem nenhuma UTE a GNL.
+
+    O DECOMP grava o registro 9 de todo estagio mesmo sem UTE a GNL: o registro
+    fica com `numero_utes_gnl = 0` e passo 1. E o encoding mais provavel do caso
+    real, e por isso o preferido aqui em vez de payload inteiramente vazio - as
+    duas formas sao cobertas nos testes.
+    """
+    return FakeMapcut(
+        tamanho_corte=SYNTHETIC_RECORD_SIZE,
+        numero_iteracoes=SYNTHETIC_CUTS_PER_NODE,
+        numero_cortes=SYNTHETIC_CUTS_PER_NODE * 2,
+        numero_estagios=SYNTHETIC_STAGES,
+        numero_submercados=SYNTHETIC_SUBMARKET_COUNT,
+        patamares_por_estagio=[SYNTHETIC_LOAD_BLOCKS] * SYNTHETIC_STAGES,
+        numero_uhes_tempo_viagem=len(SYNTHETIC_TRAVEL_TIME_PLANT_CODES),
+        maximo_lag_tempo_viagem=SYNTHETIC_MAX_TRAVEL_TIME_LAG,
+        lag_tempo_viagem_por_uhe=list(SYNTHETIC_TRAVEL_TIME_STAGE_LAGS),
+        codigos_uhes=list(SYNTHETIC_PLANT_CODES),
+        registro_ultimo_corte_no=synthetic_last_cut_table(),
+        codigos_uhes_jusante=list(np.array([2, 0], dtype=np.int32).view(np.float32)),
+        data=FakeSectionFile(
+            FakeSection(
+                {
+                    "dados_tempo_viagem": synthetic_travel_time_payload(),
+                    "dados_gnl": [0] * SYNTHETIC_STAGES,
+                }
+            )
+        ),
     )
 
 
@@ -212,6 +390,7 @@ def write_synthetic_cortdeco(
     path: Path,
     padding_byte: int = 0,
     coefficient_count: int = SYNTHETIC_COEFFICIENT_COUNT,
+    record_size: int = SYNTHETIC_RECORD_SIZE,
 ) -> None:
     """Grava um cortdeco sintetico de 7 registros.
 
@@ -225,6 +404,9 @@ def write_synthetic_cortdeco(
         coefficient_count: quantos coeficientes gravar por registro. O padrao e o
             do caso sintetico com tempo de viagem; o caso sem tempo de viagem usa
             um registro mais curto, sem o bloco de defluencia passada.
+        record_size: tamanho de cada registro, em bytes. Casos com mais
+            coeficientes precisam de registro maior, senao os coeficientes nao
+            cabem no registro.
     """
     next_record = {0: 0}  # registro 0 nao existe; mantem o dicionario homogeneo
     for chain in SYNTHETIC_CHAINS.values():
@@ -233,7 +415,7 @@ def write_synthetic_cortdeco(
             next_record[record] = chain[position + 1] if has_next else 0
 
     used = 4 + 8 * coefficient_count
-    padding = bytes([padding_byte]) * (SYNTHETIC_RECORD_SIZE - used)
+    padding = bytes([padding_byte]) * (record_size - used)
     with path.open("wb") as handle:
         for record in range(1, SYNTHETIC_TOTAL_RECORDS + 1):
             handle.write(np.int32(next_record[record]).tobytes())
@@ -263,6 +445,28 @@ def synthetic_cortdeco_sem_tempo_viagem(tmp_path: Path) -> Path:
     path = tmp_path / "cortdeco.sintetico_sem_tempo_viagem"
     write_synthetic_cortdeco(
         path, coefficient_count=SYNTHETIC_COEFFICIENT_COUNT_WITHOUT_TRAVEL_TIME
+    )
+    return path
+
+
+@pytest.fixture
+def synthetic_cortdeco_sem_gnl(tmp_path: Path) -> Path:
+    """Cortdeco sintetico do caso sem GNL (registro mais curto ainda)."""
+    path = tmp_path / "cortdeco.sintetico_sem_gnl"
+    write_synthetic_cortdeco(
+        path, coefficient_count=SYNTHETIC_COEFFICIENT_COUNT_WITHOUT_GNL
+    )
+    return path
+
+
+@pytest.fixture
+def synthetic_cortdeco_gnl_maior(tmp_path: Path) -> Path:
+    """Cortdeco do caso de GNL com dois submercados e tres patamares."""
+    path = tmp_path / "cortdeco.sintetico_gnl_maior"
+    write_synthetic_cortdeco(
+        path,
+        coefficient_count=SYNTHETIC_COEFFICIENT_COUNT_GNL_MAIOR,
+        record_size=SYNTHETIC_RECORD_SIZE_GNL_MAIOR,
     )
     return path
 
@@ -334,19 +538,32 @@ def settings_file(tmp_path: Path) -> Path:
     return path
 
 
-@pytest.fixture(scope="session")
-def real_mapcut_path() -> Path:
-    """Caminho do mapcut real; ignora o teste quando ele nao esta no repositorio."""
-    path = PROJECT_ROOT / "mapcut.rv0"
+def _real_deck_path(attribute: str) -> Path:
+    """Localiza um binario de entrada do caso presente no diretorio do projeto.
+
+    O nome do arquivo muda a cada revisao do caso (mapcut.rv0, mapcut.rv4, ...),
+    entao fixa-lo aqui faz a suite de integracao inteira ser ignorada em silencio
+    na proxima troca de deck - foi o que aconteceu. A fonte da verdade e o
+    proprio `settings.json` do projeto, resolvido pelo codigo de producao: assim
+    o teste segue o deck configurado e ainda exercita `load_settings`.
+    """
+    settings_path = PROJECT_ROOT / "settings.json"
+    if not settings_path.is_file():
+        pytest.skip(f"settings.json ausente: {settings_path}")
+    settings = load_settings(settings_path)
+    path: Path = getattr(settings.paths, attribute)
     if not path.is_file():
         pytest.skip(f"binario real ausente: {path}")
     return path
+
+
+@pytest.fixture(scope="session")
+def real_mapcut_path() -> Path:
+    """Caminho do mapcut real; ignora o teste quando ele nao esta no repositorio."""
+    return _real_deck_path("mapcut_path")
 
 
 @pytest.fixture(scope="session")
 def real_cortdeco_path() -> Path:
     """Caminho do cortdeco real; ignora o teste quando ele nao esta no repositorio."""
-    path = PROJECT_ROOT / "cortdeco.rv0"
-    if not path.is_file():
-        pytest.skip(f"binario real ausente: {path}")
-    return path
+    return _real_deck_path("cortdeco_path")

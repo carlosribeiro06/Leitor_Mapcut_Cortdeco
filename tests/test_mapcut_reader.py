@@ -1,13 +1,18 @@
 """Testes das correcoes de decodificacao do mapcut, contra o binario real.
 
-Estes testes usam o `mapcut.rv0` do repositorio, e nao um arquivo sintetico: as
-tres correcoes deste modulo existem justamente porque o `idecomp` decodifica
-esse layout de forma incorreta, e um dublê construido por nos so provaria que a
-nossa premissa e coerente consigo mesma. Contra o arquivo real, as afirmacoes
-tem conteudo - em especial a de que a reconstrucao consome exatamente todos os
-valores do payload, que e o que ancora o layout assumido.
+Estes testes usam o deck real presente no repositorio, e nao um arquivo
+sintetico: as tres correcoes deste modulo existem justamente porque o `idecomp`
+decodifica esse layout de forma incorreta, e um dublê construido por nos so
+provaria que a nossa premissa e coerente consigo mesma. Contra o arquivo real, as
+afirmacoes tem conteudo - em especial a de que a reconstrucao consome exatamente
+todos os valores do payload, que e o que ancora o layout assumido.
 
-Quando os binarios nao estao presentes, os testes sao ignorados (ver conftest).
+Qual deck e esse vem do `settings.json`, porque o nome do arquivo muda a cada
+revisao do caso (ver `conftest`); quando os binarios nao estao presentes, os
+testes sao ignorados. Em troca, o que cada teste pode afirmar depende do caso em
+disco: os que dependem de um bloco especifico se ignoram sozinhos quando o deck
+presente nao o tem, e os numeros de um deck conhecido ficam pinados em
+`test_deck_com_tempo_viagem.py`.
 """
 
 from __future__ import annotations
@@ -22,6 +27,11 @@ from leitor_mapcut_cortdeco.geometry import build_cut_geometry
 from leitor_mapcut_cortdeco.mapcut_reader import (
     TRAVEL_TIME_DTYPES,
     TRAVEL_TIME_LAGS_DTYPES,
+    # Helper privado, importado de proposito: e ele que define o contrato da
+    # tabela de auditoria de GNL - vazia exatamente quando a propriedade do
+    # idecomp nao pode ser avaliada. Reafirmar esse contrato aqui e mais honesto
+    # que reimplementar a condicao no teste.
+    _idecomp_gnl_frame_is_evaluable,
     build_mapcut_tables,
     read_mapcut,
 )
@@ -36,6 +46,14 @@ TRAVEL_TIME_TABLES = (
     "mapcut_tempo_viagem",
     "mapcut_tempo_viagem_lags",
     "mapcut_tempo_viagem_idecomp_bruto",
+)
+
+# Idem para o bloco de GNL, quando o caso nao tem UTE a GNL.
+GNL_TABLES = (
+    "mapcut_gnl",
+    "mapcut_gnl_bloco_valores",
+    "mapcut_submercados_gnl",
+    "mapcut_gnl_idecomp_bruto",
 )
 
 
@@ -89,15 +107,23 @@ def test_so_estao_vazias_as_tabelas_cuja_ausencia_e_legitima(
 ) -> None:
     """Uma tabela vazia so e aceitavel quando o dado nao existe no caso.
 
-    A unica ausencia legitima e a do tempo de viagem, e so quando o caso nao tem
-    nenhuma UHE com tempo de viagem. Qualquer outra tabela vazia e defeito de
-    decodificacao, e por isso a comparacao e por igualdade de conjuntos - nao por
-    inclusao, que deixaria passar tabela vazia inesperada.
+    Sao tres as ausencias legitimas: as tabelas de tempo de viagem quando o caso
+    nao tem UHE com tempo de viagem, as de GNL quando nao tem UTE a GNL, e a de
+    auditoria de GNL quando a propriedade do idecomp que a produz nao pode ser
+    avaliada. Qualquer outra tabela vazia e defeito de decodificacao, e por isso a
+    comparacao e por igualdade de conjuntos - nao por inclusao, que deixaria
+    passar tabela vazia inesperada.
     """
     tables = real_tables["tables"]
-    esperadas_vazias = (
-        set(TRAVEL_TIME_TABLES) if _travel_time_plant_count(real_tables) == 0 else set()
-    )
+    esperadas_vazias: set[str] = set()
+    if _travel_time_plant_count(real_tables) == 0:
+        esperadas_vazias |= set(TRAVEL_TIME_TABLES)
+    if not real_tables["geometry"].gnl_submarket_codes:
+        esperadas_vazias |= set(GNL_TABLES)
+    elif not _idecomp_gnl_frame_is_evaluable(real_tables["mapcut"]):
+        # Ha GNL, mas a propriedade que produz a saida literal nao e avaliavel
+        # neste deck: so a tabela de auditoria fica vazia.
+        esperadas_vazias.add("mapcut_gnl_idecomp_bruto")
 
     vazias = {name for name, table in tables.items() if table.empty}
 
@@ -206,16 +232,28 @@ def test_tempo_viagem_bruto_do_idecomp_repete_a_primeira_usina(
 
 
 def test_gnl_corrigido_cobre_todos_os_estagios(real_tables: dict) -> None:
-    """O passo errado do idecomp decodifica so o primeiro estagio."""
+    """O passo errado do idecomp decodifica menos estagios do que existem.
+
+    Quantos estagios a saida bruta cobre depende do deck - com muitos estagios
+    ela para no primeiro, com poucos nem chega a ser avaliavel -, portanto o que
+    se afirma aqui e a inclusao estrita: a saida bruta e sempre um subconjunto
+    proprio da corrigida.
+    """
     mapcut = real_tables["mapcut"]
     gnl = real_tables["tables"]["mapcut_gnl"]
     bruto = real_tables["tables"]["mapcut_gnl_idecomp_bruto"]
     stage_count = int(mapcut.numero_estagios)
+    if gnl.empty:
+        pytest.skip("o deck presente nao tem UTE a GNL")
 
     assert sorted(gnl["estagio"].unique()) == list(range(1, stage_count + 1))
-    assert len(gnl) == stage_count * int(gnl["numero_utes_gnl"].iloc[0])
-    assert sorted(bruto["estagio"].unique()) == [1], (
-        "a saida bruta do idecomp deveria cobrir apenas o primeiro estagio"
+    # Cada estagio traz exatamente as UTEs que ele declara.
+    por_estagio = gnl.groupby("estagio")["numero_utes_gnl"].agg(["size", "first"])
+    assert (por_estagio["size"] == por_estagio["first"]).all()
+
+    estagios_brutos = set(bruto["estagio"].unique()) if not bruto.empty else set()
+    assert estagios_brutos < set(gnl["estagio"].unique()), (
+        "a saida bruta do idecomp deveria cobrir menos estagios que a corrigida"
     )
 
 
